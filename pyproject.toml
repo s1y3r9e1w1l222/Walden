@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wechat-local-readonly"
+version = "0.1.0"
+license = {text = "Apache-2.0"}
+description = "Read-only, bounded local WeChat message queries for macOS"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "sqlcipher3==0.6.2",
+  "zstandard==0.25.0",
+]
+
+[project.optional-dependencies]
+images = ["Pillow==11.3.0", "cryptography==45.0.6"]
+
+[project.scripts]
+wechat-local-window = "wechat_local.codex_first_runtime:main"
+wechat-local-reply = "wechat_local.reply_workflow:reply_cli_main"
+wechat-local-setup = "wechat_local.source_setup:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*.LICENSE"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+wechat_local = [
+  "resources/*.md",
+  "resources/docs/*.md",
+  "resources/licenses/*",
+  "resources/skills/wechat-local-query/*.md",
+  "resources/tools/*.py",
+  "resources/tools/*.sh",
+]
+
