@@ -50,4 +50,4 @@ Walden 帮你在自己的 Mac 上查看和整理已经同步到本机的消息�
 
 ## 许可证
 
-Walden 主项目采用 [Apache License 2.0](LICENSE)。第三方组件仍遵循各自的许可证，声明随包保留。当前材料尚未公开上传或分发。
+Walden 主项目采用 [Apache License 2.0](LICENSE)。第三方组件仍遵循各自的许可证，声明随包保留。源码已在 [GitHub](https://github.com/s1y3r9e1w1l222/Walden) 公开。
