@@ -11,6 +11,58 @@ import wechat_local.normalization_worker as normalizer
 import wechat_local.event_store as event_store_module
 
 class ScopeTests(ContactQueryTests):
+    def test_explicit_context_keeps_full_group_and_does_not_drain_old_backlog(self):
+        source=SourceKey('synthetic-account','synthetic-generation','message_0.db',table(TARGET))
+        msg=RawMessage(99,999,1,1700000005,10,b'old unrelated pending',0)
+        window=WindowIngestRun(datetime.fromtimestamp(1699999990,timezone.utc),datetime.fromtimestamp(1700000010,timezone.utc),{'source_min_time':1700000005,'source_max_time':1700000005,'examined_count':1})
+        with EventStore(self.f.event_store_path) as store:
+            cat=LiveCatalog.dynamic_encrypted(self.f.message_root,fixture.PASSPHRASE,store=store,account_id='synthetic-account',source_generation='synthetic-generation');cat.close()
+            store.commit_window_messages(source,[msg],window)
+            outbox=store._conn.execute('SELECT o.id FROM processing_outbox o JOIN event_revisions r ON r.id=o.revision_id WHERE r.raw_content=?',(b'old unrelated pending',)).fetchone()[0]
+            state=store.ensure_outbox_consumer_state(outbox,normalizer.CONSUMER_NAME,normalizer.CONTRACT_VERSION,normalizer.NORMALIZER_VERSION)
+            store._conn.execute("UPDATE outbox_consumer_state SET status='processing', lease_owner='other-worker', lease_expires_at='2001-01-01T00:00:00+00:00' WHERE id=?",(state.id,));store._conn.commit()
+            before=tuple(store._conn.execute('SELECT status,lease_owner,lease_expires_at FROM outbox_consumer_state WHERE id=?',(state.id,)).fetchone())
+        code,result,_=self.run_cli('--conversation-username',GROUP2)
+        self.assertEqual(code,0);self.assertEqual(result['status'],'ok')
+        texts=[r['citation_text'] for g in result['groups'] for r in g['event_refs']]
+        self.assertEqual(set(texts),{'target group','other group'})
+        with EventStore(self.f.event_store_path) as store:
+            self.assertEqual(tuple(store._conn.execute('SELECT status,lease_owner,lease_expires_at FROM outbox_consumer_state WHERE id=?',(state.id,)).fetchone()),before)
+            self.assertEqual(store._conn.execute('SELECT count(*) FROM current_window_baseline').fetchone()[0],0)
+            self.assertEqual(store._conn.execute('SELECT count(*) FROM current_empty_window_coverage').fetchone()[0],0)
+        import sqlite3
+        c=sqlite3.connect(self.f.agent_store_path)
+        try:
+            self.assertEqual(c.execute('SELECT COALESCE(max(last_materialization_id),0) FROM projection_checkpoints').fetchone()[0],0)
+            self.assertEqual(c.execute("SELECT count(*) FROM event_search_fts WHERE searchable_text LIKE '%old unrelated pending%'").fetchone()[0],0)
+        finally:c.close()
+
+    def test_explicit_context_source_identity_snapshot_and_wal_change(self):
+        from wechat_local.live_identity import _username_for_table
+        c=fixture._open_encrypted_writer(self.f.message_path)
+        try:c.execute('PRAGMA journal_mode=WAL');c.commit()
+        finally:c.close()
+        original=runtime.read_message_window;observed=[]
+        def read(conn,name,*args,**kwargs):
+            if name==table(GROUP2) and not observed:
+                w=fixture._open_encrypted_writer(self.f.message_path)
+                try:w.execute('UPDATE Name2Id SET user_name=? WHERE rowid=12',(OTHER,));w.commit()
+                finally:w.close()
+                observed.append(_username_for_table(conn,name))
+            return original(conn,name,*args,**kwargs)
+        with patch.object(runtime,'read_message_window',new=read):code,result,_=self.run_cli('--conversation-username',GROUP2)
+        self.assertEqual(observed,[GROUP2]);self.assertEqual(result['status'],'unavailable')
+
+    def test_explicit_context_large_confirmation_is_bound_to_conversation(self):
+        c=fixture._open_encrypted_writer(self.f.message_path)
+        try:c.execute('INSERT INTO "'+table(GROUP2)+'" VALUES(32,3022,1,1700000004,10,?,0,NULL)',(b'other group extra',));c.commit()
+        finally:c.close()
+        window=['--request','从 2023-11-14 00:00 到 2023-11-17 00:00']
+        code,first,_=self.run_cli('--conversation-username',GROUP2,*window)
+        self.assertEqual(first['status'],'confirmation_required');token=first['confirmation']['token']
+        code,second,_=self.run_cli('--conversation-username',fixture.GROUP,'--confirmation-token',token,*window)
+        self.assertEqual(second['status'],'confirmation_required');self.assertNotEqual(second['confirmation']['token'],token)
+
     def test_fractional_related_group_and_preflight_use_same_bounds(self):
         seen=[];original=runtime.read_message_window
         def read(connection,name,*args,**kwargs):

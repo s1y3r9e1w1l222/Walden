@@ -259,6 +259,7 @@ class CodexFirstRuntime:
         self.voice_sources_refresh = voice_sources_refresh
         self.scan_start = scan_start
         self._contact_target: str | None = None
+        self._conversation_target: str | None = None
         self._contact_related = False
         self._contact_unknown_sources: set[SourceKey] = set()
         self._contact_guard: Callable[[], None] | None = None
@@ -380,7 +381,7 @@ class CodexFirstRuntime:
                         shard.connection.execute('BEGIN')
                         scoped_transaction = True
                         if source in self._scope_private:
-                            if _username_for_table(shard.connection, source.table_name) != self._contact_target:
+                            if _username_for_table(shard.connection, source.table_name) != (self._contact_target or self._conversation_target):
                                 raise LiveReadonlyError('Private conversation identity changed')
                         else:
                             row = shard.connection.execute('SELECT user_name FROM Name2Id WHERE rowid=?', (self._scope_senders[source],)).fetchone()
@@ -513,14 +514,14 @@ class CodexFirstRuntime:
         self._scope_private = set()
         self._scope_epochs = {}
         self._scope_gaps = []
-        if self._contact_target is None:
+        if self._contact_target is None and self._conversation_target is None:
             return
         self.catalog.refresh_catalog()
         sources = self._sources()
         allowed = set()
         by_connection = {}
         for source in sources:
-            if not self._contact_group_source(source):
+            if self._conversation_target is not None or not self._contact_group_source(source):
                 shard = self.catalog.shard_for_source(source)
                 if shard is None:
                     self._scope_gaps.append('target_private_source_unavailable')
@@ -529,7 +530,7 @@ class CodexFirstRuntime:
                 username = _username_for_table(shard.connection, source.table_name)
                 if before is None or self._voice_epoch(shard) != before:
                     raise LiveReadonlyError('Live message source changed')
-                if username != self._contact_target:
+                if username != (self._contact_target or self._conversation_target):
                     self._scope_gaps.append('target_private_source_unavailable')
                     continue
                 existing = self._scope_epochs.get(id(shard.connection))
@@ -610,12 +611,13 @@ class CodexFirstRuntime:
         if (window.end - window.start).total_seconds() <= LARGE_QUERY_SECONDS:
             return QueryPreflight("preflight", estimated_rows, available_bytes)
         token_material = "|".join((window.start.isoformat(), window.end.isoformat(), str(estimated_rows)))
-        if self._contact_target is not None:
-            token_material += '|' + json.dumps([self._contact_target, self._contact_related], ensure_ascii=True, separators=(',', ':'))
+        if self._contact_target is not None or self._conversation_target is not None:
+            token_material += '|' + json.dumps([self._contact_target, self._contact_related, self._conversation_target], ensure_ascii=True, separators=(',', ':'))
             scope = sorted((source.shard_name, source.table_name, sender)
                            for source, sender in self._scope_senders.items())
+            whole = sorted((source.shard_name, source.table_name) for source in self._scope_private)
             stamps = sorted((str(shard.path), epoch[2]) for shard, epoch in self._scope_epochs.values())
-            token_material += '|' + json.dumps([scope, stamps, self._contact_binding], ensure_ascii=True, separators=(',', ':'))
+            token_material += '|' + json.dumps([scope, whole, stamps, self._contact_binding], ensure_ascii=True, separators=(',', ':'))
         return QueryPreflight(
             "awaiting_confirmation", estimated_rows, available_bytes,
             hashlib.sha256(token_material.encode("utf-8")).hexdigest(),
@@ -988,7 +990,7 @@ class CodexFirstRuntime:
         self._request_preflight_window = None
         if self.scan_start is not None:
             self.scan_start()
-        if self._contact_target is not None:
+        if self._contact_target is not None or self._conversation_target is not None:
             if self._contact_guard is not None:
                 self._contact_guard()
             self._prepare_contact_scope(window)
@@ -1301,7 +1303,7 @@ class CodexFirstRuntime:
         if any(self._voice_epoch(shard) is None for shard in self.catalog.shards):
             return self._unavailable(self._coverage(window, minimums, maximums, [*gaps, "source_changed"]), "source_changed")
 
-        if self._contact_target is None:
+        if self._contact_target is None and self._conversation_target is None:
             self._project()
         else:
             worker = NormalizationWorker(self.event_store, 'codex-first-' + secrets.token_hex(8))
@@ -1367,7 +1369,7 @@ class CodexFirstRuntime:
                 contract_version=profile.contract_version,
                 normalizer_name=profile.normalizer_name,
                 normalizer_version=profile.normalizer_version,
-                **({'_exact': True} if self._contact_target is not None else {}),
+                **({'_exact': True} if self._contact_target is not None or self._conversation_target is not None else {}),
                 **({'_by_local_id': by_local_id} if has_voice else {}),
             )
             overlap = materializations.keys() & resolved.keys()
@@ -2029,7 +2031,10 @@ def _run_cli(args: argparse.Namespace) -> int:
                 scan_start=identity.begin_scan,
             )
             runtime._scan_workers = _WINDOW_SHARD_WORKERS
-            runtime._empty_window_enabled = target_resolution is None
+            runtime._empty_window_enabled = target_resolution is None and args.conversation_username is None
+            if args.conversation_username is not None:
+                runtime._conversation_target = args.conversation_username
+                runtime._contact_guard = ensure_contact_stable
             if target_resolution is not None:
                 runtime._contact_target = target_resolution['selected_username']
                 runtime._contact_related = args.include_related_groups
