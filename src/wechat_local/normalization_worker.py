@@ -260,9 +260,25 @@ class NormalizationWorker:
         if state is None:
             return ProcessOneResult("idle", False)
 
+        return self._process_claimed(state)
+
+    def process_exact(self, outbox_id: int) -> ProcessOneResult:
+        """Process only this outbox signal without touching unrelated leases."""
+        state = self.store.ensure_outbox_consumer_state(
+            outbox_id, CONSUMER_NAME, CONTRACT_VERSION, NORMALIZER_VERSION
+        )
+        if state.status == "complete":
+            return ProcessOneResult("normalized", False)
+        state = self.store.begin_outbox_consumer_attempt(
+            state.id, self.lease_owner, self._lease_expiry()
+        )
+        return self._process_claimed(state, require_current=True)
+
+    def _process_claimed(self, state, *, require_current=False) -> ProcessOneResult:
+
         try:
             source = self.store.load_claimed_process_event(
-                state.id, self.lease_owner
+                state.id, self.lease_owner, **({'_require_current': True} if require_current else {})
             )
         except MissingSourceRevision:
             return self._fail(state, MISSING_SOURCE_REVISION)

@@ -424,6 +424,22 @@ class ProjectionWorker:
                 checkpoint=int(checkpoint["last_materialization_id"]),
             )
         projected = [_project_materialization(row, self.profile) for row in rows]
+        inserted = self._write_projected(projected, advance=True)
+        return ProjectionRunResult(
+            read=len(rows), projected=inserted, checkpoint=projected[-1].materialization_id
+        )
+
+    def run_exact(self, materializations) -> None:
+        """Project only selected materializations without moving the global checkpoint."""
+        if not materializations:
+            return
+        self._ensure_profile()
+        projected = [_project_materialization(vars(row), self.profile) for row in materializations]
+        self._write_projected(projected, advance=False)
+
+    def _write_projected(self, projected, *, advance: bool) -> int:
+        connection = self.store._conn
+        profile_id = self.profile.profile_id
         now = _utc_now()
         inserted = 0
         with self.store._lock:
@@ -500,23 +516,22 @@ class ProjectionWorker:
                         ).fetchone()
                         if fts is None or fts["searchable_text"] != event.searchable_text:
                             raise ProjectionError("Projection FTS consistency conflict")
-                last_id = projected[-1].materialization_id
-                connection.execute(
-                    """
-                    UPDATE projection_checkpoints
-                    SET last_materialization_id=?,
-                        projected_count=projected_count+?, updated_at=?
-                    WHERE profile_id=?
-                    """,
-                    (last_id, inserted, now, profile_id),
-                )
+                if advance:
+                    last_id = projected[-1].materialization_id
+                    connection.execute(
+                        """
+                        UPDATE projection_checkpoints
+                        SET last_materialization_id=?,
+                            projected_count=projected_count+?, updated_at=?
+                        WHERE profile_id=?
+                        """,
+                        (last_id, inserted, now, profile_id),
+                    )
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
-        return ProjectionRunResult(
-            read=len(rows), projected=inserted, checkpoint=projected[-1].materialization_id
-        )
+        return inserted
 
     def rebuild(self) -> None:
         self._ensure_profile()

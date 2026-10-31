@@ -141,7 +141,10 @@ For a user-named contact, pass `--contact-query <remark, nickname, alias or conf
 with the requested time window. Add `--include-related-groups` only when the user asks for groups
 where that contact actually spoke: this returns that contact's own messages in verified groups, not
 all group participants or general group context. Inspect `target_resolution` before presenting any
-result. Exact unique matches resolve; for ambiguous or suggested candidates show the limited choices,
+result. For explicitly requested bounded group context, use the verified `conversation_username`
+from a related-group event with the existing `--conversation-username` window entry; do not guess
+from a display name or automatically expand the window.
+Exact unique matches resolve; for ambiguous or suggested candidates show the limited choices,
 using their remark, nickname and alias when needed to distinguish them,
 and let the user choose, then pass the chosen stable username using the same option. Do not ask the
 user to locate a technical username. A missing, unsupported, unavailable or changed contact source

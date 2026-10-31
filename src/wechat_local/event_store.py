@@ -2999,6 +2999,8 @@ class EventStore:
         self,
         consumer_state_id: int,
         lease_owner: str,
+        *,
+        _require_current: bool = False,
     ) -> ClaimedProcessEvent:
         """Read the exact immutable revision behind an owned process-event claim."""
 
@@ -3036,7 +3038,7 @@ class EventStore:
             LEFT JOIN event_revisions AS revision ON revision.id=outbox.revision_id
             LEFT JOIN events AS event ON event.id=revision.event_id
             WHERE state.id=?
-            """,
+            """ + (" AND event.current_revision_id=revision.id" if _require_current else ""),
             (consumer_state_id,),
         ).fetchone()
         if row is None:
@@ -3281,6 +3283,7 @@ class EventStore:
         normalizer_name: str,
         normalizer_version: str,
         _by_local_id: dict[int, StandardEventMaterialization | None] | None = None,
+        _exact: bool = False,
     ) -> dict[str, StandardEventMaterialization]:
         """Resolve only exact, current revisions observed in one source read.
 
@@ -3301,6 +3304,31 @@ class EventStore:
 
         results: dict[str, StandardEventMaterialization] = {}
         local_ids = sorted(expected)
+        if _exact:
+            for offset in range(0, len(local_ids), 300):
+                chunk = local_ids[offset:offset + 300]
+                values = ','.join('(?,?)' for _ in chunk)
+                params = [value for local_id in chunk for value in (local_id, expected[local_id])]
+                rows = self._conn.execute(
+                    f"WITH wanted(local_id, fingerprint) AS (VALUES {values}) "
+                    "SELECT materialization.*, event.local_id FROM wanted "
+                    "JOIN events AS event ON event.local_id=wanted.local_id "
+                    "JOIN event_revisions AS revision ON revision.id=event.current_revision_id "
+                    "AND revision.content_fingerprint=wanted.fingerprint "
+                    "JOIN standard_event_materializations AS materialization ON materialization.source_revision_id=revision.id "
+                    "WHERE event.account_id=? AND event.source_generation=? AND event.shard_name=? AND event.table_name=? "
+                    "AND materialization.contract_version=? AND materialization.normalizer_name=? AND materialization.normalizer_version=?",
+                    (*params, *self._source_values(source), *profile),
+                ).fetchall()
+                for row in rows:
+                    local_id = int(row['local_id'])
+                    materialization = _materialization_from_row(row)
+                    if materialization.event_id in results:
+                        raise EventStoreError('Duplicate materialization identity')
+                    results[materialization.event_id] = materialization
+                    if _by_local_id is not None:
+                        _by_local_id[local_id] = None if local_id in _by_local_id else materialization
+            return results
         for offset in range(0, len(local_ids), 500):
             chunk = local_ids[offset : offset + 500]
             placeholders = ",".join("?" for _ in chunk)
@@ -3333,6 +3361,30 @@ class EventStore:
                 if _by_local_id is not None:
                     _by_local_id[local_id] = None if local_id in _by_local_id else materialization
         return results
+
+    def _exact_window_outboxes(self, source: SourceKey, messages: list[RawMessage]) -> list[int]:
+        """Resolve current source revisions from metadata before loading any body."""
+        expected = {message.local_id: _content_fingerprint(message) for message in messages}
+        if len(expected) != len(messages):
+            raise EventStoreError('Duplicate local identity')
+        result = []
+        ids = sorted(expected)
+        for offset in range(0, len(ids), 300):
+            chunk = ids[offset:offset + 300]
+            values = ','.join('(?,?)' for _ in chunk)
+            params = [v for local_id in chunk for v in (local_id, expected[local_id])]
+            rows = self._conn.execute(
+                f'WITH wanted(local_id,fingerprint) AS (VALUES {values}) '
+                'SELECT outbox.id FROM wanted JOIN events AS event ON event.local_id=wanted.local_id '
+                'JOIN event_revisions AS revision ON revision.id=event.current_revision_id AND revision.content_fingerprint=wanted.fingerprint '
+                'JOIN processing_outbox AS outbox ON outbox.revision_id=revision.id AND outbox.task_kind=\'process_event\' '
+                'WHERE event.account_id=? AND event.source_generation=? AND event.shard_name=? AND event.table_name=?',
+                (*params, *self._source_values(source)),
+            ).fetchall()
+            if len(rows) != len(chunk):
+                raise EventStoreError('Selected revision changed')
+            result.extend(int(row[0]) for row in rows)
+        return result
 
     def _insert_standard_event_materialization(
         self,

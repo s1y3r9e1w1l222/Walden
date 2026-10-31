@@ -52,7 +52,7 @@ from .event_store import (
     _materialization_from_row,
 )
 from .live_catalog import LiveCatalog, LiveCatalogError, discover_numeric_shards
-from .live_identity import LiveIdentityAdapter
+from .live_identity import LiveIdentityAdapter, _username_for_table
 from .live_readonly import (
     LiveReadonlyError,
     open_encrypted_readonly,
@@ -61,7 +61,8 @@ from .live_readonly import (
     validate_live_storage_paths,
 )
 from .local_voice_runtime import LocalWhisperTranscriber
-from .live_tailer import WindowReadResult, _empty_window_probe, read_message_window
+from .live_tailer import (WindowReadResult, _empty_window_probe, read_message_window,
+                          SOURCE_TIMESTAMP_LOWER_BOUND, SOURCE_TIMESTAMP_UPPER_BOUND)
 from .normalization_worker import NormalizationWorker
 from .standard_event_repository import ProjectionProfile, StandardEventRepository
 from .voice_transcript import VoiceMessageBinding, VoiceTranscriptEnricher
@@ -252,6 +253,13 @@ class CodexFirstRuntime:
         self._contact_related = False
         self._contact_unknown_sources: set[SourceKey] = set()
         self._contact_guard: Callable[[], None] | None = None
+        self._contact_group_source = None
+        self._scope_senders: dict[SourceKey, int] = {}
+        self._scope_private: set[SourceKey] = set()
+        self._scope_allowed: set[SourceKey] | None = None
+        self._scope_epochs = {}
+        self._scope_gaps: list[str] = []
+        self._contact_binding = None
         self._query_failures: list[dict[str, str]] = []
         self._request_preflight: QueryPreflight | None = None
         self._request_preflight_state: tuple | None = None
@@ -357,7 +365,21 @@ class CodexFirstRuntime:
             for source, shard in group['items']:
                 if cancelled.is_set():
                     break
+                scoped_transaction = False
                 try:
+                    if source in self._scope_senders or source in self._scope_private:
+                        shard.connection.execute('BEGIN')
+                        scoped_transaction = True
+                        if source in self._scope_private:
+                            if _username_for_table(shard.connection, source.table_name) != self._contact_target:
+                                raise LiveReadonlyError('Private conversation identity changed')
+                        else:
+                            row = shard.connection.execute('SELECT user_name FROM Name2Id WHERE rowid=?', (self._scope_senders[source],)).fetchone()
+                            if row is None or row[0] != self._contact_target:
+                                raise LiveReadonlyError('Related sender identity changed')
+                    scoped_epoch = self._scope_epochs.get(id(shard.connection))
+                    if scoped_epoch is not None and self._voice_epoch(shard) != scoped_epoch[1]:
+                        raise LiveReadonlyError('Live message source changed')
                     before = self._voice_epoch(shard) if self.voice_enricher is not None else None
                     can_prove = self._empty_window_enabled and self._baseline_metadata_scan and before_by_connection.get(id(shard.connection)) is not None
                     empty, no_future = _empty_window_probe(shard.connection, source.table_name, start=start, end=end) if can_prove else (False, False)
@@ -368,12 +390,16 @@ class CodexFirstRuntime:
                             shard.connection, source.table_name,
                             start_unix_seconds=start, end_unix_seconds=end,
                             batch_size=self.batch_size, _cancelled=cancelled.is_set,
+                            **({'_sender_id': self._scope_senders[source]} if source in self._scope_senders else {}),
                             **({'collect_voice_packed': True} if self.voice_enricher is not None else {}),
                         ))
                     epoch = before if before is not None and before == self._voice_epoch(shard) else None
                     result[source] = (read, epoch, None, no_future, empty)
                 except Exception as error:
                     result[source] = (None, None, error, False, False)
+                finally:
+                    if scoped_transaction:
+                        shard.connection.rollback()
             if self._empty_window_enabled:
                 stable = {}
                 for _, shard in group['items']:
@@ -469,7 +495,80 @@ class CodexFirstRuntime:
             and source.source_generation == self.source_generation
             and self.catalog.shard_for_source(source) is not None
             and (self.source_filter is None or self.source_filter(source))
+            and (self._scope_allowed is None or source in self._scope_allowed)
         ]
+
+    def _prepare_contact_scope(self, window: TimeWindow) -> None:
+        self._scope_allowed = None
+        self._scope_senders = {}
+        self._scope_private = set()
+        self._scope_epochs = {}
+        self._scope_gaps = []
+        if self._contact_target is None:
+            return
+        self.catalog.refresh_catalog()
+        sources = self._sources()
+        allowed = set()
+        by_connection = {}
+        for source in sources:
+            if not self._contact_group_source(source):
+                shard = self.catalog.shard_for_source(source)
+                if shard is None:
+                    self._scope_gaps.append('target_private_source_unavailable')
+                    continue
+                before = self._voice_epoch(shard)
+                username = _username_for_table(shard.connection, source.table_name)
+                if before is None or self._voice_epoch(shard) != before:
+                    raise LiveReadonlyError('Live message source changed')
+                if username != self._contact_target:
+                    self._scope_gaps.append('target_private_source_unavailable')
+                    continue
+                self._scope_epochs[id(shard.connection)] = (shard, before)
+                self._scope_private.add(source)
+                allowed.add(source)
+                continue
+            shard = self.catalog.shard_for_source(source)
+            if shard is None:
+                self._scope_gaps.append('related_sender_unknown')
+                continue
+            connection = shard.connection
+            key = id(connection)
+            if key not in by_connection:
+                before = self._voice_epoch(shard)
+                try:
+                    rows = connection.execute('SELECT rowid,user_name FROM Name2Id WHERE user_name=? LIMIT 2', (self._contact_target,)).fetchall()
+                    sender = int(rows[0][0]) if len(rows) == 1 and rows[0][1] == self._contact_target and type(rows[0][0]) is int else None
+                except Exception:
+                    sender = None
+                after = self._voice_epoch(shard)
+                if before is None or before != after:
+                    raise LiveReadonlyError('Live message source changed')
+                existing = self._scope_epochs.get(key)
+                if existing is not None and existing[1] != before:
+                    raise LiveReadonlyError('Live message source changed')
+                by_connection[key] = sender
+                self._scope_epochs[key] = (shard, before)
+            sender = by_connection[key]
+            if sender is None:
+                self._scope_gaps.append('related_sender_unknown')
+                continue
+            quoted = '"' + source.table_name.replace('"', '""') + '"'
+            params = (int(window.start.timestamp()), int(window.end.timestamp()))
+            try:
+                unknown = connection.execute(
+                    f"SELECT 1 FROM {quoted} AS msg WHERE typeof(create_time)='integer' AND create_time>={SOURCE_TIMESTAMP_LOWER_BOUND} AND create_time<{SOURCE_TIMESTAMP_UPPER_BOUND} AND create_time>=? AND create_time<=? AND (real_sender_id IS NULL OR typeof(real_sender_id)<>'integer' OR NOT EXISTS (SELECT 1 FROM Name2Id AS sender WHERE sender.rowid=msg.real_sender_id AND typeof(sender.user_name)='text' AND sender.user_name<>'')) LIMIT 1", params).fetchone()
+                found = connection.execute(
+                    f"SELECT 1 FROM {quoted} WHERE typeof(create_time)='integer' AND create_time>={SOURCE_TIMESTAMP_LOWER_BOUND} AND create_time<{SOURCE_TIMESTAMP_UPPER_BOUND} AND create_time>=? AND create_time<=? AND typeof(real_sender_id)='integer' AND real_sender_id=? LIMIT 1", (*params,sender)).fetchone()
+            except Exception as exc:
+                raise LiveReadonlyError('Related sender metadata unavailable') from exc
+            if unknown:
+                self._scope_gaps.append('related_sender_unknown')
+            if found:
+                allowed.add(source)
+                self._scope_senders[source] = sender
+        if any(self._voice_epoch(shard) != epoch for shard,epoch in self._scope_epochs.values()):
+            raise LiveReadonlyError('Live message source changed')
+        self._scope_allowed = allowed
 
     def preflight(self, window: TimeWindow) -> QueryPreflight:
         if not isinstance(window, TimeWindow):
@@ -485,17 +584,27 @@ class CodexFirstRuntime:
                 # This is a bounded lower-bound sample for the requested
                 # window, not a whole-history count or coverage proof.
                 quoted = '"' + source.table_name.replace('"', '""') + '"'
+                sender = self._scope_senders.get(source)
+                predicate = " AND typeof(real_sender_id)='integer' AND real_sender_id=?" if sender is not None else ''
+                parameters = ((start_seconds, end_seconds, sender, PREFLIGHT_SAMPLE_LIMIT) if sender is not None else
+                              (start_seconds, end_seconds, PREFLIGHT_SAMPLE_LIMIT))
                 estimated_rows += len(shard.connection.execute(
-                    f"SELECT 1 FROM {quoted} WHERE typeof(create_time)='integer' "
-                    "AND create_time >= ? AND create_time <= ? LIMIT ?",
-                    (start_seconds, end_seconds, PREFLIGHT_SAMPLE_LIMIT),
+                    f"SELECT 1 FROM {quoted} WHERE typeof(create_time)='integer' AND create_time>={SOURCE_TIMESTAMP_LOWER_BOUND} AND create_time<{SOURCE_TIMESTAMP_UPPER_BOUND} "
+                    f"AND create_time >= ? AND create_time <= ?{predicate} LIMIT ?",
+                    parameters,
                 ).fetchall())
+        if any(self._voice_epoch(shard) != epoch for shard,epoch in self._scope_epochs.values()):
+            raise LiveReadonlyError('Live message source changed')
         available_bytes = os.statvfs(self.event_store.path.parent).f_bavail * os.statvfs(self.event_store.path.parent).f_frsize
         if (window.end - window.start).total_seconds() <= LARGE_QUERY_SECONDS:
             return QueryPreflight("preflight", estimated_rows, available_bytes)
         token_material = "|".join((window.start.isoformat(), window.end.isoformat(), str(estimated_rows)))
         if self._contact_target is not None:
             token_material += '|' + json.dumps([self._contact_target, self._contact_related], ensure_ascii=True, separators=(',', ':'))
+            scope = sorted((source.shard_name, source.table_name, sender)
+                           for source, sender in self._scope_senders.items())
+            stamps = sorted((str(shard.path), epoch[2]) for shard, epoch in self._scope_epochs.values())
+            token_material += '|' + json.dumps([scope, stamps, self._contact_binding], ensure_ascii=True, separators=(',', ':'))
         return QueryPreflight(
             "awaiting_confirmation", estimated_rows, available_bytes,
             hashlib.sha256(token_material.encode("utf-8")).hexdigest(),
@@ -868,6 +977,12 @@ class CodexFirstRuntime:
         self._request_preflight_window = None
         if self.scan_start is not None:
             self.scan_start()
+        if self._contact_target is not None:
+            if self._contact_guard is not None:
+                self._contact_guard()
+            self._prepare_contact_scope(window)
+            if self._contact_guard is not None:
+                self._contact_guard()
         if (window.end - window.start).total_seconds() > LARGE_QUERY_SECONDS:
             before = self._source_state()
             preflight = self.preflight(window)
@@ -889,7 +1004,7 @@ class CodexFirstRuntime:
                 if source.account_id == self.account_id
                 and source.source_generation == self.source_generation
             ]
-            gaps = ["live_source_unavailable"]
+            gaps = ["live_source_unavailable", *self._scope_gaps]
             if self._contact_target is not None:
                 gaps.append('target_private_source_unavailable')
             if missing:
@@ -954,6 +1069,7 @@ class CodexFirstRuntime:
         minimums: list[int] = []
         maximums: list[int] = []
         gaps: list[str] = []
+        gaps.extend(self._scope_gaps)
         if self._contact_target is not None:
             if self._contact_unknown_sources:
                 gaps.append('related_source_identity_unknown')
@@ -1030,6 +1146,10 @@ class CodexFirstRuntime:
             self._parallel_window_reads(sources, worker_included, start_seconds, end_seconds)
             if self._scan_workers > 1 or self._empty_window_enabled else None
         )
+        if any(self._voice_epoch(shard) != epoch for shard,epoch in self._scope_epochs.values()):
+            return self._unavailable(self._coverage(window, minimums, maximums, [*gaps, 'source_changed']), 'source_changed')
+        if self._contact_guard is not None:
+            self._contact_guard()
         max_empty_epochs = {}
         if self._empty_window_enabled and parallel_reads is not None:
             for source, value in parallel_reads.items():
@@ -1070,6 +1190,7 @@ class CodexFirstRuntime:
                         end_unix_seconds=end_seconds,
                         batch_size=self.batch_size,
                         **({'collect_voice_packed': True} if self.voice_enricher is not None else {}),
+                        **({'_sender_id': self._scope_senders[source]} if source in self._scope_senders else {}),
                     )
                 if voice_before is not None and voice_before == self._voice_epoch(shard):
                     for local_id, packed in read.voice_packed.items():
@@ -1152,7 +1273,27 @@ class CodexFirstRuntime:
         if any(self._voice_epoch(shard) is None for shard in self.catalog.shards):
             return self._unavailable(self._coverage(window, minimums, maximums, [*gaps, "source_changed"]), "source_changed")
 
-        self._project()
+        if self._contact_target is None:
+            self._project()
+        else:
+            worker = NormalizationWorker(self.event_store, 'codex-first-' + secrets.token_hex(8))
+            selected_materializations = []
+            profile = ProjectionProfile()
+            for source, messages in scanned_messages:
+                for outbox_id in self.event_store._exact_window_outboxes(source, messages):
+                    outcome = worker.process_exact(outbox_id)
+                    if outcome.outcome not in ('normalized', 'degraded'):
+                        raise EventStoreError('Selected normalization unavailable')
+                exact = self.event_store.standard_event_materializations_for_messages(
+                    source, messages, contract_version=profile.contract_version,
+                    normalizer_name=profile.normalizer_name, normalizer_version=profile.normalizer_version,
+                    _exact=True,
+                )
+                if len(exact) != len(messages):
+                    raise EventStoreError('Selected materialization unavailable')
+                selected_materializations.extend(exact.values())
+            with StandardEventRepository(self.event_store.path) as repository:
+                ProjectionWorker(repository, self.agent_store).run_exact(selected_materializations)
         try:
             contributing = {id(self.catalog.shard_for_source(source).connection)
                             for source,messages in scanned_messages if messages
@@ -1198,6 +1339,7 @@ class CodexFirstRuntime:
                 contract_version=profile.contract_version,
                 normalizer_name=profile.normalizer_name,
                 normalizer_version=profile.normalizer_version,
+                **({'_exact': True} if self._contact_target is not None else {}),
                 **({'_by_local_id': by_local_id} if has_voice else {}),
             )
             overlap = materializations.keys() & resolved.keys()
@@ -1236,6 +1378,7 @@ class CodexFirstRuntime:
                 elif self._contact_related and isinstance(username, str) and username.endswith('@chatroom'):
                     sender = ref.get('sender_identity')
                     if sender == self._contact_target:
+                        ref['conversation_username'] = username
                         selected_refs.append(ref)
                     elif sender in (None, 'unknown'):
                         gaps.append('related_sender_unknown')
@@ -1701,6 +1844,8 @@ def _run_cli(args: argparse.Namespace) -> int:
             def ensure_contact_stable() -> None:
                 if contact_epoch is not None and (identity.contact_connection is None or identity._epoch(identity.contact_connection) != contact_epoch):
                     raise ContactQueryError('contact_source_changed')
+                if any(runtime._voice_epoch(shard) != epoch for shard,epoch in runtime._scope_epochs.values()):
+                    raise LiveReadonlyError('Live message source changed')
 
             unknown_sources: set[SourceKey] = set()
             def selected_source(source: SourceKey) -> bool:
@@ -1856,12 +2001,14 @@ def _run_cli(args: argparse.Namespace) -> int:
                 scan_start=identity.begin_scan,
             )
             runtime._scan_workers = _WINDOW_SHARD_WORKERS
-            runtime._empty_window_enabled = True
+            runtime._empty_window_enabled = target_resolution is None
             if target_resolution is not None:
                 runtime._contact_target = target_resolution['selected_username']
                 runtime._contact_related = args.include_related_groups
                 runtime._contact_unknown_sources = unknown_sources
                 runtime._contact_guard = ensure_contact_stable
+                runtime._contact_binding = contact_epoch[2] if contact_epoch is not None else None
+                runtime._contact_group_source = lambda source: bool((identity.conversation_username(source) or '').endswith('@chatroom'))
             for connection_id, device, inode in catalog_identities.values():
                 runtime._bound_shards[connection_id] = (device, inode)
 

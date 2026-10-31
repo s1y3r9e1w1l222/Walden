@@ -194,6 +194,7 @@ def read_message_window(
     batch_size: int,
     collect_voice_packed: bool = False,
     _cancelled: Callable[[], bool] | None = None,
+    _sender_id: int | None = None,
 ) -> WindowReadResult:
     """Read source rows in an inclusive create-time window without mutation.
 
@@ -253,6 +254,10 @@ def read_message_window(
                 last_local_id,
                 batch_size,
             )
+        sender_predicate = ''
+        if _sender_id is not None:
+            sender_predicate = " AND typeof(real_sender_id)='integer' AND real_sender_id=?"
+            query_params = (*query_params[:-1], _sender_id, query_params[-1])
         rows = conn.execute(
             f"""
             SELECT local_id, {server_id_expression}, local_type, create_time,
@@ -262,7 +267,7 @@ def read_message_window(
             WHERE typeof(create_time)='integer'
               AND create_time >= {SOURCE_TIMESTAMP_LOWER_BOUND}
               AND create_time < {SOURCE_TIMESTAMP_UPPER_BOUND}
-              AND create_time >= ? AND create_time <= ?{local_id_predicate}
+              AND create_time >= ? AND create_time <= ?{local_id_predicate}{sender_predicate}
             ORDER BY local_id ASC
             LIMIT ?
             """,
