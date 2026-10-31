@@ -79,6 +79,15 @@ class ContactQueryError(CodexFirstError):
     """A fixed, content-free contact-resolution failure."""
 
 
+def _inclusive_source_seconds(window: TimeWindow) -> tuple[int, int]:
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    start = window.start.astimezone(timezone.utc) - epoch
+    end = window.end.astimezone(timezone.utc) - epoch
+    first = start.days * 86400 + start.seconds + bool(start.microseconds)
+    last = end.days * 86400 + end.seconds
+    return int(first), int(last)
+
+
 def _diagnostic_reason(error: Exception) -> str:
     if isinstance(error, PermissionError):
         return "permission_denied"
@@ -523,6 +532,9 @@ class CodexFirstRuntime:
                 if username != self._contact_target:
                     self._scope_gaps.append('target_private_source_unavailable')
                     continue
+                existing = self._scope_epochs.get(id(shard.connection))
+                if existing is not None and existing[1] != before:
+                    raise ContactQueryError('source_changed')
                 self._scope_epochs[id(shard.connection)] = (shard, before)
                 self._scope_private.add(source)
                 allowed.add(source)
@@ -553,7 +565,7 @@ class CodexFirstRuntime:
                 self._scope_gaps.append('related_sender_unknown')
                 continue
             quoted = '"' + source.table_name.replace('"', '""') + '"'
-            params = (int(window.start.timestamp()), int(window.end.timestamp()))
+            params = _inclusive_source_seconds(window)
             try:
                 unknown = connection.execute(
                     f"SELECT 1 FROM {quoted} AS msg WHERE typeof(create_time)='integer' AND create_time>={SOURCE_TIMESTAMP_LOWER_BOUND} AND create_time<{SOURCE_TIMESTAMP_UPPER_BOUND} AND create_time>=? AND create_time<=? AND (real_sender_id IS NULL OR typeof(real_sender_id)<>'integer' OR NOT EXISTS (SELECT 1 FROM Name2Id AS sender WHERE sender.rowid=msg.real_sender_id AND typeof(sender.user_name)='text' AND sender.user_name<>'')) LIMIT 1", params).fetchone()
@@ -576,8 +588,7 @@ class CodexFirstRuntime:
         self.catalog.refresh_catalog()
         sources = self._sources()
         estimated_rows = 0
-        start_seconds = int(window.start.timestamp())
-        end_seconds = int(window.end.timestamp())
+        start_seconds, end_seconds = _inclusive_source_seconds(window)
         for source in sources:
             shard = self.catalog.shard_for_source(source)
             if shard is not None:
@@ -983,6 +994,24 @@ class CodexFirstRuntime:
             self._prepare_contact_scope(window)
             if self._contact_guard is not None:
                 self._contact_guard()
+        start_seconds, end_seconds = _inclusive_source_seconds(window)
+        if start_seconds > end_seconds:
+            self.catalog.refresh_catalog()
+            sources = self._sources()
+            gaps = list(self._scope_gaps)
+            if self._contact_target is not None and self._contact_unknown_sources:
+                gaps.append('related_source_identity_unknown')
+            if not sources:
+                gaps.append('live_source_unavailable')
+                if self._contact_target is not None:
+                    gaps.append('target_private_source_unavailable')
+                return self._unavailable(self._coverage(window, [], [], gaps), 'source_unavailable')
+            if self._contact_target is not None and not self._scope_private:
+                gaps.append('target_private_source_unavailable')
+            result = ScanResult((), self._coverage(window, [], [], gaps), 0)
+            if on_base_messages is not None:
+                on_base_messages(result)
+            return result
         if (window.end - window.start).total_seconds() > LARGE_QUERY_SECONDS:
             before = self._source_state()
             preflight = self.preflight(window)
@@ -1064,8 +1093,7 @@ class CodexFirstRuntime:
         ):
             raise TypeError("capability_check returned invalid source evidence")
 
-        start_seconds = int(window.start.timestamp())
-        end_seconds = int(window.end.timestamp())
+        start_seconds, end_seconds = _inclusive_source_seconds(window)
         minimums: list[int] = []
         maximums: list[int] = []
         gaps: list[str] = []
@@ -2133,7 +2161,7 @@ def main(argv: list[str] | None = None) -> int:
             args._stream_complete = True
         return result
     except ContactQueryError as error:
-        category = str(error) if str(error) in {'contact_query_required', 'contact_query_empty', 'contact_query_with_check_config', 'contact_source_changed', 'contact_target_unsupported'} else 'contact_source_unavailable'
+        category = str(error) if str(error) in {'contact_query_required', 'contact_query_empty', 'contact_query_with_check_config', 'contact_source_changed', 'contact_target_unsupported', 'source_changed'} else 'contact_source_unavailable'
         reason = category
         args._target_resolution = {'status': 'unavailable', 'reason': category}
     except SourceSetupError as error:

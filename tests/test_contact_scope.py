@@ -11,6 +11,83 @@ import wechat_local.normalization_worker as normalizer
 import wechat_local.event_store as event_store_module
 
 class ScopeTests(ContactQueryTests):
+    def test_fractional_related_group_and_preflight_use_same_bounds(self):
+        seen=[];original=runtime.read_message_window
+        def read(connection,name,*args,**kwargs):
+            result=original(connection,name,*args,**kwargs);seen.extend(m.create_time for m in result.messages);return result
+        with patch.object(runtime,'read_message_window',new=read):
+            code,result,_=self.run_cli('--contact-query','Target Remark','--include-related-groups','--request','从 2023-11-14 22:13:20.500000 到 2023-11-14 22:13:22.500000')
+        self.assertEqual(code,0);self.assertEqual(result['status'],'ok');self.assertEqual(result['total_count'],2)
+        self.assertEqual(sorted(seen),[1700000001,1700000002])
+        code,result,_=self.run_cli('--contact-query','Target Remark','--include-related-groups','--request','从 2023-11-14 22:13:20.500000 到 2023-11-17 00:00')
+        self.assertEqual(result['status'],'confirmation_required');self.assertEqual(result['confirmation']['estimated_rows'],3)
+
+    def test_fractional_start_never_fetches_or_persists_earlier_second(self):
+        seen=[]; original=runtime.read_message_window
+        def read(connection,name,*args,**kwargs):
+            result=original(connection,name,*args,**kwargs);seen.extend(message.raw_content for message in result.messages);return result
+        with patch.object(runtime,'read_message_window',new=read):
+            code,result,_=self.run_cli('--contact-query','Target Remark','--request','从 2023-11-14 22:13:20.500000 到 2023-11-14 22:13:21.500000')
+        self.assertEqual(code,0);self.assertEqual(result['total_count'],1)
+        self.assertNotIn(b'private incoming',seen)
+        with EventStore(self.f.event_store_path) as store:self.assertEqual(store._conn.execute('SELECT count(*) FROM event_revisions WHERE raw_content=?',(b'private incoming',)).fetchone()[0],0)
+
+    def test_fractional_window_without_integer_second_has_no_body_or_proof(self):
+        calls=[]; original=runtime.read_message_window
+        def read(*args,**kwargs):calls.append(True);return original(*args,**kwargs)
+        with patch.object(runtime,'read_message_window',new=read):
+            code,result,_=self.run_cli('--contact-query','Target Remark','--request','从 2023-11-14 22:13:20.100000 到 2023-11-14 22:13:20.900000')
+        self.assertEqual(code,0);self.assertEqual(result['status'],'ok');self.assertEqual(result['total_count'],0);self.assertFalse(calls)
+        with EventStore(self.f.event_store_path) as store:
+            self.assertEqual(store._conn.execute('SELECT count(*) FROM event_revisions').fetchone()[0],0)
+            self.assertEqual(store._conn.execute('SELECT count(*) FROM current_window_baseline').fetchone()[0],0)
+            self.assertEqual(store._conn.execute('SELECT count(*) FROM current_empty_window_coverage').fetchone()[0],0)
+
+    def test_group_discovery_epoch_cannot_be_overwritten_by_later_private_source(self):
+        import wechat_local.live_catalog as live_catalog
+        group=next('scope-earlier-'+str(i)+'@chatroom' for i in range(100) if table('scope-earlier-'+str(i)+'@chatroom')<table(TARGET))
+        c=fixture._open_encrypted_writer(self.f.message_path)
+        try:
+            c.execute('PRAGMA journal_mode=WAL')
+            c.execute('INSERT INTO Name2Id(rowid,user_name) VALUES(?,?)',(20,group))
+            c.execute('CREATE TABLE "'+table(group)+'" (local_id INTEGER PRIMARY KEY,server_id INTEGER,local_type INTEGER,create_time INTEGER,real_sender_id INTEGER,message_content BLOB,WCDB_CT_message_content INTEGER,packed_info_data BLOB)')
+            c.commit()
+        finally:c.close()
+        contact=fixture._open_encrypted_writer(self.f.voice_path)
+        try:
+            contact.execute('CREATE TABLE contact(username TEXT,alias TEXT,remark TEXT,nick_name TEXT)')
+            contact.execute('INSERT INTO contact VALUES(?,?,?,?)',(TARGET,'person-alias','Target Remark','Target Nick'))
+            contact.commit()
+        finally:contact.close()
+        mutation=[];reads=[];original_read=runtime.read_message_window;original_open=live_catalog.open_encrypted_readonly
+        class Cursor:
+            def __init__(self,cur,query):self.cur,self.query=cur,query
+            def __getattr__(self,n):return getattr(self.cur,n)
+            def __iter__(self):return self
+            def __next__(self):return next(self.cur)
+            def fetchone(self):
+                row=self.cur.fetchone()
+                if table(group) in self.query and "typeof(real_sender_id)='integer' AND real_sender_id=? LIMIT 1" in self.query and not mutation:
+                    w=fixture._open_encrypted_writer(self_path)
+                    try:w.execute('INSERT INTO "'+table(group)+'" VALUES(71,711,1,1700000001,9,?,0,NULL)',(b'new target',));w.commit();mutation.append(True)
+                    finally:w.close()
+                return row
+        class Connection:
+            def __init__(self,c):self.c=c
+            def __getattr__(self,n):return getattr(self.c,n)
+            def execute(self,query,*args):return Cursor(self.c.execute(query,*args),query)
+        self_path=self.f.message_path
+        def open_source(*args,**kwargs):
+            connection,key=original_open(*args,**kwargs);return Connection(connection),key
+        def read(connection,name,*args,**kwargs):
+            reads.append(name);return original_read(connection,name,*args,**kwargs)
+        with patch.object(live_catalog,'open_encrypted_readonly',new=open_source),patch.object(runtime,'read_message_window',new=read):
+            code,result,_=self.run_cli('--contact-query','Target Remark','--include-related-groups',contact_path=self.f.voice_path)
+        self.assertTrue(mutation);self.assertEqual(code,2);self.assertEqual(result['status'],'unavailable')
+        self.assertEqual(result.get('error_code'),'source_changed')
+        self.assertFalse(result.get('groups'));self.assertFalse(reads)
+        with EventStore(self.f.event_store_path) as store:self.assertEqual(store._conn.execute('SELECT count(*) FROM event_revisions').fetchone()[0],0)
+
     def test_missing_or_duplicate_sender_mapping_never_falls_back_to_group_body(self):
         for mode in ('missing','duplicate'):
             with self.subTest(mode=mode):
