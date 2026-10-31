@@ -3,7 +3,7 @@ import contextlib,io,json,unittest
 from datetime import datetime,timezone
 from unittest.mock import patch
 from tests import test_codex_first_voice_cli as fixture
-from tests.test_contact_query import ContactQueryTests,TARGET,OTHER,GROUP2,table
+from tests.test_contact_query import ContactQueryTests,TARGET,OTHER,SELF,GROUP2,table
 from wechat_local.event_store import EventStore,SourceKey,RawMessage,WindowIngestRun
 from wechat_local.live_catalog import LiveCatalog
 import wechat_local.codex_first_runtime as runtime
@@ -11,6 +11,15 @@ import wechat_local.normalization_worker as normalizer
 import wechat_local.event_store as event_store_module
 
 class ScopeTests(ContactQueryTests):
+    def test_explicit_context_jsonl_configuration_failure_has_one_complete(self):
+        f=self.f;argv=['--live-db-root',str(f.live_root),'--message-root',str(f.message_root),'--passphrase',str(f.passphrase),'--event-store',str(f.event_store_path),'--agent-store',str(f.event_store_path),'--account-id','synthetic-account','--source-generation','synthetic-generation','--self-username',SELF,'--request','从 2023-11-14 22:13 到 2023-11-14 22:15','--timezone','UTC','--voice-transcripts','--voice-jsonl','--conversation-username',GROUP2]
+        out,err=io.StringIO(),io.StringIO()
+        with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):code=runtime.main(argv)
+        rows=[json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual(code,2);self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['phase'],'complete');self.assertEqual(rows[0]['status'],'unavailable')
+        self.assertIn('diagnostics',rows[0])
+
     def test_explicit_context_keeps_full_group_and_does_not_drain_old_backlog(self):
         source=SourceKey('synthetic-account','synthetic-generation','message_0.db',table(TARGET))
         msg=RawMessage(99,999,1,1700000005,10,b'old unrelated pending',0)

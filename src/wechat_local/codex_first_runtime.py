@@ -2189,7 +2189,7 @@ def main(argv: list[str] | None = None) -> int:
         category = "runtime_unavailable"
         reason = _diagnostic_reason(error)
     failure = {"stage": getattr(args, "_diagnostic_stage", "configuration"), "reason": reason}
-    if args.voice_jsonl and (getattr(args, '_stream_started', False) or args.contact_query is not None) and not getattr(args, '_stream_complete', False):
+    if args.voice_jsonl and (getattr(args, '_stream_started', False) or args.contact_query is not None or args.conversation_username is not None) and not getattr(args, '_stream_complete', False):
         print(json.dumps({'phase': 'complete', 'status': 'unavailable', 'error_code': category,
                           **({'target_resolution': args._target_resolution} if hasattr(args, '_target_resolution') else {}),
                           'diagnostics': {'failures': [failure]}}, sort_keys=True), flush=True)
