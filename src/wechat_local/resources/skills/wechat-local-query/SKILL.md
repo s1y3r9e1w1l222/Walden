@@ -137,13 +137,27 @@ use the recorded `window_cli --source-config <reference>` with the user-specifie
 rule/request-derived opt-in flags. The query validates configuration and opens each message shard read-only for the
 same invocation. Use `--check-config --json` separately only when diagnosing configuration; it is not a query prerequisite.
 Do not manually reconstruct source paths or labels, infer a venv path, or search for another account's database.
+For a user-named contact, pass `--contact-query <remark, nickname, alias or confirmed username>`
+with the requested time window. Add `--include-related-groups` only when the user asks for groups
+where that contact actually spoke: this returns that contact's own messages in verified groups, not
+all group participants or general group context. Inspect `target_resolution` before presenting any
+result. Exact unique matches resolve; for ambiguous or suggested candidates show the limited choices,
+using their remark, nickname and alias when needed to distinguish them,
+and let the user choose, then pass the chosen stable username using the same option. Do not ask the
+user to locate a technical username. A missing, unsupported, unavailable or changed contact source
+must be reported and must never widen the query to all messages.
+`contact_identity_conflict` means the stable identity is duplicated in the contact source; report
+the conflict rather than suggesting that choosing the same username can resolve it. Preserve gaps including
+missing private conversation, unknown group identity or unknown sender. For large windows use the
+returned confirmation for the same chosen contact and related-groups setting. When a JSONL stream
+has begun, a later failed `complete` supersedes any earlier provisional messages.
 For an existing source reference, verify its file permissions and path structure without reading the
 passphrase file contents. Never request or print passphrases. For a missing source reference, follow the first-use
 instructions above; do not suggest that preparing a key path is the user's responsibility. If the config/command
 is absent or malformed, report the exact missing setting. If configuration, identity or source coverage is
 unavailable, state that precisely and preserve any messages already returned.
 
-An optional `--contact-database` accepts an explicitly selected, already-readable SQLite `contact.db` with `contact(username, alias, remark, nick_name)`. Alternatively, `--encrypted-contact-database` accepts one explicitly selected encrypted contact database under the configured live database root and opens it read-only with the verified query passphrase. These options are mutually exclusive; there is no path discovery, plaintext fallback, or contact-table enumeration. The lookup is restricted to exact stable usernames relevant to returned messages. Keep each `sender_identity` intact when adding its `sender_display_name`; missing, duplicate, unsupported or unavailable rows remain unknown while base messages remain visible.
+An optional `--contact-database` accepts an explicitly selected, already-readable SQLite `contact.db` with `contact(username, alias, remark, nick_name)`. Alternatively, `--encrypted-contact-database` accepts one explicitly selected encrypted contact database under the configured live database root and opens it read-only with the verified query passphrase. These options are mutually exclusive; there is no path discovery or plaintext fallback. Ordinary display lookup uses exact stable usernames relevant to returned messages; `--contact-query` additionally reads the four current-contact fields for matching, returning only bounded candidates. Keep each `sender_identity` intact when adding its `sender_display_name`; missing, duplicate, unsupported or unavailable rows remain unknown while base messages remain visible.
 
 The runtime may expose `source_facts` for returned messages. On every query use the current `contact.mute_status`: apply the existing muted-group summary rule only to `muted`, and the unmuted-group rule to `unmuted`. The runtime assigns these only to a verified `@chatroom` with exact integer `chat_room_notify` 0 or 1, respectively; do not independently infer status from raw fields. For unknown or unavailable mute status, explicitly tell the user the mute-dependent rule could not be fully applied and preserve original messages; never treat unknown as unmuted. Setup's overall incomplete mute status does not mean every group is unknown, nor does it confirm private-chat mute semantics. A setup-time result cannot establish future group settings. `verify_flag_raw`, `contact_local_type_raw` and all other unrecognized values do not determine mute status or subtype. Mention facts are parsed only from bounded source XML belonging to the selected message window. `at_self` is proven only by exact token match against a confirmed source-config identity or an explicitly trusted `--self-username`; `notify@all` is separate. Never show the raw mention-token list. Missing source, invalid/oversized XML or unavailable identity yields `unknown`, not a negative result.
 

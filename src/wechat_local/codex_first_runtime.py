@@ -74,6 +74,10 @@ LARGE_QUERY_SECONDS = 24 * 60 * 60
 PREFLIGHT_SAMPLE_LIMIT = 10_001
 
 
+class ContactQueryError(CodexFirstError):
+    """A fixed, content-free contact-resolution failure."""
+
+
 def _diagnostic_reason(error: Exception) -> str:
     if isinstance(error, PermissionError):
         return "permission_denied"
@@ -244,6 +248,10 @@ class CodexFirstRuntime:
         self.projection_batch_size = projection_batch_size
         self.voice_sources_refresh = voice_sources_refresh
         self.scan_start = scan_start
+        self._contact_target: str | None = None
+        self._contact_related = False
+        self._contact_unknown_sources: set[SourceKey] = set()
+        self._contact_guard: Callable[[], None] | None = None
         self._query_failures: list[dict[str, str]] = []
         self._request_preflight: QueryPreflight | None = None
         self._request_preflight_state: tuple | None = None
@@ -486,6 +494,8 @@ class CodexFirstRuntime:
         if (window.end - window.start).total_seconds() <= LARGE_QUERY_SECONDS:
             return QueryPreflight("preflight", estimated_rows, available_bytes)
         token_material = "|".join((window.start.isoformat(), window.end.isoformat(), str(estimated_rows)))
+        if self._contact_target is not None:
+            token_material += '|' + json.dumps([self._contact_target, self._contact_related], ensure_ascii=True, separators=(',', ':'))
         return QueryPreflight(
             "awaiting_confirmation", estimated_rows, available_bytes,
             hashlib.sha256(token_material.encode("utf-8")).hexdigest(),
@@ -736,6 +746,8 @@ class CodexFirstRuntime:
                 if context is None:
                     enriched_messages.append(displayed)
                     continue
+                if self._contact_guard is not None:
+                    self._contact_guard()
                 source, raw_message, materialization, captured_packed = context
                 canonical = self._canonical_payload(materialization)
                 revision_number = canonical.get("sequence")
@@ -810,6 +822,8 @@ class CodexFirstRuntime:
                 if context is None or (int(context[1].local_type) & 0xFFFFFFFF) != 3:
                     messages.append(displayed)
                     continue
+                if self._contact_guard is not None:
+                    self._contact_guard()
                 try:
                     image = dict(self.image_enricher(*context, group.conversation_id))
                 except Exception:
@@ -876,6 +890,8 @@ class CodexFirstRuntime:
                 and source.source_generation == self.source_generation
             ]
             gaps = ["live_source_unavailable"]
+            if self._contact_target is not None:
+                gaps.append('target_private_source_unavailable')
             if missing:
                 gaps.append("known_source_missing")
             coverage = self._coverage(
@@ -938,6 +954,12 @@ class CodexFirstRuntime:
         minimums: list[int] = []
         maximums: list[int] = []
         gaps: list[str] = []
+        if self._contact_target is not None:
+            if self._contact_unknown_sources:
+                gaps.append('related_source_identity_unknown')
+            if not any(callable(evidence.conversation_identity_for_source)
+                       and evidence.conversation_identity_for_source(source) == self._contact_target for source in sources):
+                gaps.append('target_private_source_unavailable')
         for missing in self.event_store.source_catalog_sources("unavailable"):
             if (
                 missing.account_id == self.account_id
@@ -1204,6 +1226,20 @@ class CodexFirstRuntime:
         event_refs = self._window_event_refs(window, evidence, materializations, message_contexts)
         if len(event_refs) != len(materializations):
             gaps.append("event_projection_unavailable")
+        if self._contact_target is not None:
+            selected_refs = []
+            for ref in event_refs:
+                context = message_contexts.get(ref.get('event_id'))
+                username = evidence.conversation_identity_for_source(context[0]) if context is not None and callable(evidence.conversation_identity_for_source) else None
+                if username == self._contact_target:
+                    selected_refs.append(ref)
+                elif self._contact_related and isinstance(username, str) and username.endswith('@chatroom'):
+                    sender = ref.get('sender_identity')
+                    if sender == self._contact_target:
+                        selected_refs.append(ref)
+                    elif sender in (None, 'unknown'):
+                        gaps.append('related_sender_unknown')
+            event_refs = selected_refs
         coverage = self._coverage(window, minimums, maximums, gaps)
         service = CodexFirstService(
             evidence.display_name if evidence.contact_mapping_proven else None,
@@ -1329,7 +1365,10 @@ def build_parser() -> argparse.ArgumentParser:
     contact_sources.add_argument("--contact-database", type=Path, help="explicit read-only plaintext contact.db for exact username-to-name lookup")
     contact_sources.add_argument("--encrypted-contact-database", type=Path, help="explicit read-only encrypted contact.db under --live-db-root")
     parser.add_argument("--include-public-accounts", action="store_true")
-    parser.add_argument("--conversation-username", help="exact Name2Id username; restricts sources before preflight and content reads")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--conversation-username", help="exact Name2Id username; restricts sources before preflight and content reads")
+    target.add_argument("--contact-query", help="resolve a current contact by username, remark, nickname or alias")
+    parser.add_argument("--include-related-groups", action="store_true", help="include this contact's own messages in verified groups")
     parser.add_argument("--request")
     parser.add_argument("--timezone")
     parser.add_argument("--check-config", action="store_true")
@@ -1353,6 +1392,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _run_cli(args: argparse.Namespace) -> int:
     args._diagnostic_stage = "configuration"
+    if args.include_related_groups and args.contact_query is None:
+        raise ContactQueryError('contact_query_required')
+    if args.contact_query is not None and not args.contact_query.strip():
+        raise ContactQueryError('contact_query_empty')
+    if args.check_config and args.contact_query is not None:
+        raise ContactQueryError('contact_query_with_check_config')
     apply_source_config_to_args(args)
     if any(
         getattr(args, field, None) is None
@@ -1584,11 +1629,16 @@ def _run_cli(args: argparse.Namespace) -> int:
                 try:
                     if contact_path.is_symlink() or not contact_path.is_file():
                         raise OSError("contact source is unavailable")
+                    before = contact_path.lstat()
                     contact_connection = sqlite3.connect(
                         readonly_database_uri(contact_path), uri=True
                     )
                     contact_connection_owned = True
                     contact_connection.execute("PRAGMA query_only=ON")
+                    after = contact_path.lstat()
+                    if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                        raise OSError('contact source changed')
+                    identity._initial_shards.setdefault(id(contact_connection), (after.st_dev, after.st_ino))
                     identity.contact_connection = contact_connection
                 except (OSError, sqlite3.Error):
                     if contact_connection is not None:
@@ -1626,6 +1676,40 @@ def _run_cli(args: argparse.Namespace) -> int:
                         unavailable_source_paths.add(resolved_contact_path)
                     contact_source_unavailable = True
                     identity.contact_source_unavailable = True
+            target_resolution = None
+            contact_epoch = None
+            if args.contact_query is not None:
+                identity.begin_scan()
+                target_resolution, contact_epoch = identity.resolve_contact(args.contact_query)
+                args._target_resolution = target_resolution
+                state = target_resolution['status']
+                if state == 'resolved':
+                    selected = target_resolution['selected_username']
+                    if selected.endswith('@chatroom') or selected.startswith('gh_'):
+                        raise ContactQueryError('contact_target_unsupported')
+                else:
+                    code = 3 if state == 'ambiguous' else 2
+                    result = {'status': state, 'target_resolution': target_resolution}
+                    if state == 'unavailable':
+                        result['error_code'] = target_resolution['reason']
+                    if args.voice_jsonl:
+                        args._stream_completion = {'phase': 'complete', **result}
+                    else:
+                        args._contact_resolution_output = result
+                    return code
+
+            def ensure_contact_stable() -> None:
+                if contact_epoch is not None and (identity.contact_connection is None or identity._epoch(identity.contact_connection) != contact_epoch):
+                    raise ContactQueryError('contact_source_changed')
+
+            unknown_sources: set[SourceKey] = set()
+            def selected_source(source: SourceKey) -> bool:
+                username = identity.conversation_username(source)
+                if username is None:
+                    if args.include_related_groups:
+                        unknown_sources.add(source)
+                    return False
+                return username == target_resolution['selected_username'] or (args.include_related_groups and username.endswith('@chatroom'))
             image_key_codes: tuple[int, ...] = ()
             image_account_scope = ""
             if args.image_key_config is not None:
@@ -1763,6 +1847,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                 voice_enricher=voice_enricher,
                 image_enricher=image_enricher,
                 source_filter=(
+                    selected_source if target_resolution is not None else
                     (lambda source: identity.matches_conversation(source, args.conversation_username))
                     if args.conversation_username else None
                 ),
@@ -1772,11 +1857,19 @@ def _run_cli(args: argparse.Namespace) -> int:
             )
             runtime._scan_workers = _WINDOW_SHARD_WORKERS
             runtime._empty_window_enabled = True
+            if target_resolution is not None:
+                runtime._contact_target = target_resolution['selected_username']
+                runtime._contact_related = args.include_related_groups
+                runtime._contact_unknown_sources = unknown_sources
+                runtime._contact_guard = ensure_contact_stable
             for connection_id, device, inode in catalog_identities.values():
                 runtime._bound_shards[connection_id] = (device, inode)
 
             def emit_messages(initial: ScanResult) -> None:
+                ensure_contact_stable()
                 initial_payload = _result_payload(initial)
+                if target_resolution is not None:
+                    initial_payload['target_resolution'] = target_resolution
                 if runtime._query_failures:
                     initial_payload["diagnostics"] = {"failures": list(runtime._query_failures)}
                 print(
@@ -1790,6 +1883,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                 args._stream_started = True
 
             def emit_voice(event_id: str, voice: Mapping[str, Any]) -> None:
+                ensure_contact_stable()
                 print(
                     json.dumps(
                         {"phase": "voice", "event_id": event_id, "voice": voice},
@@ -1800,6 +1894,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                 )
 
             def emit_image(event_id: str, image: Mapping[str, Any]) -> None:
+                ensure_contact_stable()
                 print(
                     json.dumps(
                         {"phase": "image", "event_id": event_id, "image": image},
@@ -1817,12 +1912,16 @@ def _run_cli(args: argparse.Namespace) -> int:
                 on_voice_result=emit_voice if args.voice_jsonl else None,
                 on_image_result=emit_image if args.voice_jsonl else None,
             )
+            ensure_contact_stable()
             payload = _result_payload(result)
+            if target_resolution is not None:
+                payload['target_resolution'] = target_resolution
             if runtime._query_failures:
                 payload["diagnostics"] = {"failures": list(runtime._query_failures)}
             payload["contact_name_source"] = identity.contact_source_status()
             preflight = runtime.output_preflight(window) if result.status != 'unavailable' else None
             confirmation = _confirmation_payload(preflight, window, args.timezone) if preflight is not None else None
+            ensure_contact_stable()
             if args.voice_jsonl:
                 args._stream_completion = {
                     "phase": "complete",
@@ -1830,8 +1929,10 @@ def _run_cli(args: argparse.Namespace) -> int:
                     **({'error_code': result.error_code, 'gaps': list(result.coverage.gaps)} if result.status == 'unavailable' else {}),
                     "confirmation": confirmation,
                     "contact_name_source": identity.contact_source_status(),
+                    **({'target_resolution': target_resolution} if target_resolution is not None else {}),
                     **({"diagnostics": {"failures": list(runtime._query_failures)}} if runtime._query_failures else {}),
                 }
+                ensure_contact_stable()
             elif args.json:
                 payload["confirmation"] = confirmation
                 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -1875,11 +1976,19 @@ def main(argv: list[str] | None = None) -> int:
     identity_error: str | None = None
     try:
         result = _run_cli(args)
+        resolution_output = getattr(args, '_contact_resolution_output', None)
+        if resolution_output is not None:
+            text = json.dumps(resolution_output, ensure_ascii=False, sort_keys=True)
+            print(text if args.json else 'TARGET_RESOLUTION ' + text)
         completion = getattr(args, '_stream_completion', None)
         if completion is not None:
             print(json.dumps(completion, sort_keys=True), flush=True)
             args._stream_complete = True
         return result
+    except ContactQueryError as error:
+        category = str(error) if str(error) in {'contact_query_required', 'contact_query_empty', 'contact_query_with_check_config', 'contact_source_changed', 'contact_target_unsupported'} else 'contact_source_unavailable'
+        reason = category
+        args._target_resolution = {'status': 'unavailable', 'reason': category}
     except SourceSetupError as error:
         category = "configuration_unavailable"
         if str(error) in {"self_identity_binding_mismatch", "self_identity_conflict", "self_identity_invalid", "self_username_invalid"}:
@@ -1900,8 +2009,9 @@ def main(argv: list[str] | None = None) -> int:
         category = "runtime_unavailable"
         reason = _diagnostic_reason(error)
     failure = {"stage": getattr(args, "_diagnostic_stage", "configuration"), "reason": reason}
-    if args.voice_jsonl and getattr(args, '_stream_started', False) and not getattr(args, '_stream_complete', False):
+    if args.voice_jsonl and (getattr(args, '_stream_started', False) or args.contact_query is not None) and not getattr(args, '_stream_complete', False):
         print(json.dumps({'phase': 'complete', 'status': 'unavailable', 'error_code': category,
+                          **({'target_resolution': args._target_resolution} if hasattr(args, '_target_resolution') else {}),
                           'diagnostics': {'failures': [failure]}}, sort_keys=True), flush=True)
     if args.json:
         print(
@@ -1909,6 +2019,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "status": "unavailable", "error_code": category,
                     "diagnostics": {"failures": [failure]},
+                    **({'target_resolution': args._target_resolution} if hasattr(args, '_target_resolution') else {}),
                     **({"configuration_detail": identity_error, "action": "confirm_self_identity"} if identity_error else {}),
                 },
                 sort_keys=True,

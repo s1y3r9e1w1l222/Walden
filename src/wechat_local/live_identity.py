@@ -19,7 +19,7 @@ from .common import quote_identifier
 from .event_normalizer import _standard_id
 from .event_store import RawMessage, SourceKey
 from .live_catalog import LiveCatalog
-from .target_resolver import _kind
+from .target_resolver import _display_name, _kind, _matched_fields, normalize
 
 
 MAX_SOURCE_INPUT_BYTES = 262_144
@@ -360,6 +360,69 @@ class LiveIdentityAdapter:
 
     def contact_source_status(self) -> str:
         return self._contact_status_and_epoch()[0]
+
+    def resolve_contact(self, query: str, *, limit: int = 20) -> tuple[dict[str, Any], tuple | None]:
+        """Resolve against the already-open current contact source, without history."""
+        value = normalize(query)
+        if not value:
+            raise ValueError('contact_query_empty')
+        status, epoch = self._contact_status_and_epoch()
+        if status != 'configured' or epoch is None or self.contact_connection is None:
+            return {'status': 'unavailable', 'reason': 'contact_source_' + status}, None
+        buckets: dict[str, list[dict[str, Any]]] = {'username': [], 'exact': [], 'partial': []}
+        counts = {name: 0 for name in buckets}
+        try:
+            cursor = self.contact_connection.execute('SELECT username, alias, remark, nick_name FROM contact')
+            while True:
+                rows = cursor.fetchmany(256)
+                if not rows:
+                    break
+                for row in rows:
+                    if not isinstance(row[0], str) or not row[0].strip():
+                        continue
+                    item = {key: value if isinstance(value, str) else '' for key, value in zip(('username','alias','remark','nick_name'), row)}
+                    item['display_name'] = _display_name(item)
+                    exact = _matched_fields(item, value, exact=True)
+                    partial = _matched_fields(item, value, exact=False) if len(value) >= 2 else []
+                    for name, fields in (('username', ['username'] if normalize(item['username']) == value else []), ('exact', exact), ('partial', partial)):
+                        if fields:
+                            counts[name] += 1
+                            bucket = buckets[name]
+                            bucket.append({'username': item['username'], 'display_name': item['display_name'],
+                                           'remark': item['remark'], 'nick_name': item['nick_name'],
+                                           'alias': item['alias'], 'matched_fields': fields})
+                            bucket.sort(key=lambda entry: (normalize(entry['display_name']), normalize(entry['username'])))
+                            del bucket[limit:]
+            # A unique display-field match is not proof that its stable username
+            # identifies only one contact row. Check the chosen identity in the
+            # same connection and epoch before allowing any message access.
+            check_kind = ('username' if counts['username'] else
+                          'exact' if counts['exact'] == 1 else None)
+            identity_rows = None
+            if check_kind is not None:
+                identity_rows = self.contact_connection.execute(
+                    'SELECT 1 FROM contact WHERE username=? LIMIT 2',
+                    (buckets[check_kind][0]['username'],),
+                ).fetchall()
+            if self._epoch(self.contact_connection) != epoch:
+                return {'status': 'unavailable', 'reason': 'contact_source_changed'}, None
+            if identity_rows is not None and len(identity_rows) != 1:
+                return {'status': 'unavailable', 'reason': 'contact_identity_conflict'}, None
+        except Exception:
+            return {'status': 'unavailable', 'reason': 'contact_source_unavailable'}, None
+        if counts['username']:
+            kind, basis = 'username', 'exact_username'
+        elif counts['exact']:
+            kind, basis = 'exact', 'exact_contact_field'
+        elif counts['partial']:
+            kind, basis = 'partial', 'substring_suggestion_only'
+        else:
+            return {'status': 'not_found', 'match_basis': 'none', 'candidates': [], 'total_candidates': 0, 'truncated': False}, epoch
+        count = counts[kind]
+        state = 'suggestions' if kind == 'partial' else ('resolved' if count == 1 else 'ambiguous')
+        selected = buckets[kind][0]['username'] if state == 'resolved' else None
+        return {'status': state, 'match_basis': basis, 'selected_username': selected, 'candidates': buckets[kind],
+                'total_candidates': count, 'truncated': count > limit}, epoch
 
     def _contact_status_and_epoch(self) -> tuple[str, tuple | None]:
         if self.contact_source_unavailable:
