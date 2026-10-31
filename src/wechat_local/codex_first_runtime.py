@@ -16,6 +16,7 @@ import sqlite3
 import stat
 import sys
 import threading
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -222,12 +223,13 @@ class CodexFirstRuntime:
         projection_batch_size: int = 100,
         voice_sources_refresh: Callable[[], None] | None = None,
         scan_start: Callable[[], None] | None = None,
+        _locate_only: bool = False,
     ):
         if not isinstance(catalog, LiveCatalog):
             raise TypeError("catalog must be a LiveCatalog")
         if not isinstance(event_store, EventStore):
             raise TypeError("event_store must be an EventStore")
-        if not isinstance(agent_store, AgentStore):
+        if not (_locate_only and agent_store is None) and not isinstance(agent_store, AgentStore):
             raise TypeError("agent_store must be an AgentStore")
         SourceKey(
             account_id,
@@ -1542,6 +1544,7 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument("--conversation-username", help="exact Name2Id username; restricts sources before preflight and content reads")
     target.add_argument("--contact-query", help="resolve a current contact by username, remark, nickname or alias")
     parser.add_argument("--include-related-groups", action="store_true", help="include this contact's own messages in verified groups")
+    parser.add_argument("--locate-related-groups", action="store_true", help="locate groups with this contact's messages without reading message content")
     parser.add_argument("--request")
     parser.add_argument("--timezone")
     parser.add_argument("--check-config", action="store_true")
@@ -1565,6 +1568,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _run_cli(args: argparse.Namespace) -> int:
     args._diagnostic_stage = "configuration"
+    if args.locate_related_groups:
+        if args.contact_query is None or not args.include_related_groups:
+            raise ContactQueryError('locate_requires_contact_and_groups')
+        if args.check_config or args.voice_transcripts or args.voice_database or args.voice_runtime_root or args.voice_python or args.configured_images or args.image_database or args.image_attachments_root or args.image_output_root or args.image_key_config or args.image_ffmpeg:
+            raise ContactQueryError('locate_media_or_check_unsupported')
     if args.include_related_groups and args.contact_query is None:
         raise ContactQueryError('contact_query_required')
     if args.contact_query is not None and not args.contact_query.strip():
@@ -1583,7 +1591,7 @@ def _run_cli(args: argparse.Namespace) -> int:
         or args.voice_python
         or args.voice_jsonl
     )
-    if voice_options and not args.voice_transcripts:
+    if voice_options and not args.voice_transcripts and not args.locate_related_groups:
         raise LiveReadonlyError("Voice options require --voice-transcripts")
     if bool(args.voice_runtime_root) != bool(args.voice_python):
         raise LiveReadonlyError(
@@ -1659,9 +1667,9 @@ def _run_cli(args: argparse.Namespace) -> int:
         if len(set(resolved_voice_paths)) != len(resolved_voice_paths):
             raise LiveReadonlyError("Voice database paths must be unique")
         args._diagnostic_stage = "result_processing"
-        with EventStore(event_store_path) as event_store, AgentStore(
+        with EventStore(event_store_path) as event_store, (nullcontext(None) if args.locate_related_groups else AgentStore(
             args.agent_store
-        ) as agent_store:
+        )) as agent_store:
             args._diagnostic_stage = "source_open"
             catalog = LiveCatalog.dynamic_encrypted(
                 message_root,
@@ -1884,7 +1892,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     if args.include_related_groups:
                         unknown_sources.add(source)
                     return False
-                return username == target_resolution['selected_username'] or (args.include_related_groups and username.endswith('@chatroom'))
+                return ((not args.locate_related_groups and username == target_resolution['selected_username']) or (args.include_related_groups and username.endswith('@chatroom')))
             image_key_codes: tuple[int, ...] = ()
             image_account_scope = ""
             if args.image_key_config is not None:
@@ -2029,6 +2037,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                 batch_size=args.batch_size,
                 voice_sources_refresh=refresh_voice_sources,
                 scan_start=identity.begin_scan,
+                _locate_only=args.locate_related_groups,
             )
             runtime._scan_workers = _WINDOW_SHARD_WORKERS
             runtime._empty_window_enabled = target_resolution is None and args.conversation_username is None
@@ -2044,6 +2053,45 @@ def _run_cli(args: argparse.Namespace) -> int:
                 runtime._contact_group_source = lambda source: bool((identity.conversation_username(source) or '').endswith('@chatroom'))
             for connection_id, device, inode in catalog_identities.values():
                 runtime._bound_shards[connection_id] = (device, inode)
+
+            if args.locate_related_groups:
+                identity.begin_scan()
+                ensure_contact_stable()
+                initial_source_state = runtime._source_state()
+                if initial_source_state is None:
+                    raise LiveReadonlyError('Live message source changed')
+                runtime._prepare_contact_scope(window)
+                ensure_contact_stable()
+                if runtime._source_state() != initial_source_state:
+                    raise LiveReadonlyError('Live message source changed')
+                found = {}
+                for source in runtime._scope_senders:
+                    username = identity.conversation_username(source)
+                    if not isinstance(username, str) or not username.endswith('@chatroom'):
+                        raise ContactQueryError('contact_source_changed')
+                    name = identity._contact_display_name(username)
+                    if name == username:
+                        name = None
+                    found[username] = {'conversation_username': username, 'display_name': name}
+                gaps = ['conversation_attribution_unverified', 'timestamp_integrity_unverified',
+                        'source_catalog_coverage_unverified', *runtime._scope_gaps]
+                if any(group['display_name'] is None for group in found.values()):
+                    gaps.append('group_name_unknown')
+                if unknown_sources:
+                    gaps.append('related_source_identity_unknown')
+                if any(source.account_id == args.account_id and source.source_generation == args.source_generation for source in event_store.source_catalog_sources('unavailable')):
+                    gaps.append('known_source_missing')
+                ensure_contact_stable()
+                if runtime._source_state() != initial_source_state:
+                    raise LiveReadonlyError('Live message source changed')
+                result = {'status': 'partial', 'coverage_status': 'partial', 'target_resolution': target_resolution,
+                          'requested': {'start': _iso(window.start), 'end': _iso(window.end)},
+                          'groups': [found[key] for key in sorted(found)], 'gaps': list(dict.fromkeys(gaps))}
+                if args.voice_jsonl:
+                    args._stream_completion = {'phase': 'complete', **result}
+                else:
+                    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                return 0
 
             def emit_messages(initial: ScanResult) -> None:
                 ensure_contact_stable()
@@ -2166,7 +2214,7 @@ def main(argv: list[str] | None = None) -> int:
             args._stream_complete = True
         return result
     except ContactQueryError as error:
-        category = str(error) if str(error) in {'contact_query_required', 'contact_query_empty', 'contact_query_with_check_config', 'contact_source_changed', 'contact_target_unsupported', 'source_changed'} else 'contact_source_unavailable'
+        category = str(error) if str(error) in {'contact_query_required', 'contact_query_empty', 'contact_query_with_check_config', 'contact_source_changed', 'contact_target_unsupported', 'source_changed', 'locate_requires_contact_and_groups', 'locate_media_or_check_unsupported'} else 'contact_source_unavailable'
         reason = category
         args._target_resolution = {'status': 'unavailable', 'reason': category}
     except SourceSetupError as error:
@@ -2189,11 +2237,12 @@ def main(argv: list[str] | None = None) -> int:
         category = "runtime_unavailable"
         reason = _diagnostic_reason(error)
     failure = {"stage": getattr(args, "_diagnostic_stage", "configuration"), "reason": reason}
-    if args.voice_jsonl and (getattr(args, '_stream_started', False) or args.contact_query is not None or args.conversation_username is not None) and not getattr(args, '_stream_complete', False):
+    if args.voice_jsonl and (getattr(args, '_stream_started', False) or args.contact_query is not None or args.conversation_username is not None or args.locate_related_groups) and not getattr(args, '_stream_complete', False):
         print(json.dumps({'phase': 'complete', 'status': 'unavailable', 'error_code': category,
                           **({'target_resolution': args._target_resolution} if hasattr(args, '_target_resolution') else {}),
                           'diagnostics': {'failures': [failure]}}, sort_keys=True), flush=True)
-    if args.json:
+        args._stream_complete = True
+    if args.json and not (args.locate_related_groups and args.voice_jsonl and getattr(args, '_stream_complete', False)):
         print(
             json.dumps(
                 {

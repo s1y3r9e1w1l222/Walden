@@ -141,7 +141,13 @@ For a user-named contact, pass `--contact-query <remark, nickname, alias or conf
 with the requested time window. Add `--include-related-groups` only when the user asks for groups
 where that contact actually spoke: this returns that contact's own messages in verified groups, not
 all group participants or general group context. Inspect `target_resolution` before presenting any
-result. For explicitly requested bounded group context, use the verified `conversation_username`
+result. To locate group identities without reading message or media content, combine `--contact-query`,
+`--include-related-groups`, `--locate-related-groups` and the requested window. The returned partial
+list contains only groups with matching sender metadata; unknown source coverage must be reported.
+This mode cannot check message-body fingerprints or establish conversation attribution for replies;
+later message/context queries still enforce the existing conflict protection. For JSONL use
+`--voice-jsonl` as an output format without `--voice-transcripts`; location never transcribes audio.
+For explicitly requested bounded group context, use the verified `conversation_username`
 from a related-group event with the existing `--conversation-username` window entry; do not guess
 from a display name or automatically expand the window.
 Exact unique matches resolve; for ambiguous or suggested candidates show the limited choices,
