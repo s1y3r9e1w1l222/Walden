@@ -2,6 +2,7 @@
 import hashlib
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +34,26 @@ def _stamp(path):
     return tuple(result)
 
 
+class _ReplySourceSession:
+    """Connections owned by one reply source verification."""
+    def __init__(self):
+        self.db = None
+        self.connections = {}
+
+    def close(self):
+        failure = None
+        for connection in [entry[0] for entry in self.connections.values()] + ([self.db] if self.db is not None else []):
+            try:
+                connection.close()
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+        self.connections.clear()
+        self.db = None
+        if failure is not None:
+            raise failure
+
+
 def verify_reply_sources(config_path, event_ids, target_id, target_label):
     """Verify each declared event in one session; no caller status is trusted."""
     if isinstance(event_ids, str):
@@ -42,7 +63,8 @@ def verify_reply_sources(config_path, event_ids, target_id, target_label):
         raise ReplySourceError('source_binding_required')
     event_ids = tuple(sorted(set(event_ids)))
     db = contact = None
-    connections = {}
+    session = _ReplySourceSession()
+    connections = session.connections
     try:
         config_path = Path(config_path).absolute()
         config_stamp = _stamp(config_path)
@@ -55,6 +77,7 @@ def verify_reply_sources(config_path, event_ids, target_id, target_label):
             raise ReplySourceError('source_unavailable')
         store_before_open = _stamp(store_path)
         db = sqlite3.connect(readonly_database_uri(store_path), uri=True)
+        session.db = db
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA query_only=ON')
         store_version = db.execute('PRAGMA data_version').fetchone()[0]
@@ -142,16 +165,19 @@ def verify_reply_sources(config_path, event_ids, target_id, target_label):
                        for path, (connection, before, version) in connections.items())):
             raise ReplySourceError('source_unavailable')
         binding = [str(config_path), config_stamp[0][:2], store_stamp[0][:2], contact_stamp[0][:2], target_id, target_label, bindings]
-        return hashlib.sha256(json.dumps(binding, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+        digest=hashlib.sha256(json.dumps(binding, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+        return digest
     except ReplySourceError:
         raise
     except Exception as error:
         raise ReplySourceError('source_unavailable') from error
     finally:
-        for connection, _, _ in connections.values():
-            connection.close()
-        if db is not None:
-            db.close()
+        active_error = sys.exc_info()[0] is not None
+        try:
+            session.close()
+        except BaseException:
+            if not active_error:
+                raise
 
 
 def verify_reply_source(config_path, event_id, target_id, target_label):

@@ -137,6 +137,22 @@ use the recorded `window_cli --source-config <reference>` with the user-specifie
 rule/request-derived opt-in flags. The query validates configuration and opens each message shard read-only for the
 same invocation. Use `--check-config --json` separately only when diagnosing configuration; it is not a query prerequisite.
 Do not manually reconstruct source paths or labels, infer a venv path, or search for another account's database.
+For a user-named group, use `--group-query <full group name or confirmed group username>` with the requested time window. Resolve a unique group before reading its bounded conversation; ambiguous or changed identities must not be guessed. This group entry returns participants' messages in that group, not just one person's messages. A contact and a group with the same display name are distinguished by choosing the appropriate contact or group entry. Follow the type-mismatch hint when the wrong entry is used.
+
+For a specifically requested local file reference, `--file-attachments-root` accepts an explicitly selected account-local attachments directory; it locates a verified visible file reference only. It does not download, open, extract or parse file contents. Report missing, ambiguous or unverified references without guessing.
+
+When the user asks for a named contact's last conversation or how to reply without specifying dates, use
+`--contact-query <remark, nickname, alias or confirmed username> --latest` without `--request`.
+This returns up to 20 messages from both sides; `--latest N` accepts 1–100. It searches the
+configured current sources, not an assumed recent date range or guaranteed complete history.
+Surface source gaps; same-second ordering is a stable technical order, not proven real chronology,
+and a full limit does not establish that all messages at the boundary second were included.
+Use the existing dated request when the user specifies a time window.
+Do not infer a three-hour, two-day or monthly search for this request. General recent-message
+queries and dated group queries retain their existing routing. If the latest message is the user's
+own reply, or a trustworthy incoming message is unavailable, do not invent a reply suggestion or
+authorize a background context against an older incoming message.
+
 For a user-named contact, pass `--contact-query <remark, nickname, alias or confirmed username>`
 with the requested time window. Add `--include-related-groups` only when the user asks for groups
 where that contact actually spoke: this returns that contact's own messages in verified groups, not

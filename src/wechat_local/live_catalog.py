@@ -93,6 +93,7 @@ class LiveCatalog:
         store: EventStore | None = None,
         account_id: str | None = None,
         source_generation: str | None = None,
+        _borrowed_connections: tuple[Any, ...] = (),
     ):
         items = tuple(shards)
         dynamic = live_root is not None or connection_factory is not None
@@ -116,6 +117,7 @@ class LiveCatalog:
         self._account_id = account_id
         self._source_generation = source_generation
         self._owns_connections = dynamic
+        self._borrowed_connection_ids = {id(connection) for connection in _borrowed_connections}
         self._shards: tuple[LiveShard, ...] = ()
         self._routes: dict[str, tuple[LiveShard, ...]] = {}
         self._set_shards(items)
@@ -150,16 +152,23 @@ class LiveCatalog:
         account_id: str,
         source_generation: str,
         _thread_handoff: bool = False,
+        _preopened: dict[Path, Any] | None = None,
     ) -> "LiveCatalog":
         """Build a dynamic catalog using the existing verified RO opener."""
 
-        return cls.dynamic(
-            live_root,
-            (lambda path: open_encrypted_readonly(path, passphrase, _thread_handoff=True))
-            if _thread_handoff else (lambda path: open_encrypted_readonly(path, passphrase)),
+        def open_source(path):
+            if _preopened is not None and path in _preopened:
+                return _preopened[path]
+            return (open_encrypted_readonly(path, passphrase, _thread_handoff=True)
+                    if _thread_handoff else open_encrypted_readonly(path, passphrase))
+
+        return cls(
+            live_root=live_root,
+            connection_factory=open_source,
             store=store,
             account_id=account_id,
             source_generation=source_generation,
+            _borrowed_connections=tuple(_preopened.values()) if _preopened else (),
         )
 
     def _set_shards(self, items: tuple[LiveShard, ...]) -> None:
@@ -229,10 +238,13 @@ class LiveCatalog:
                 opened.append(connection)
                 new_items.append(LiveShard(path, connection))
             previous = self._shards
+            previous_routes = self._routes
             self._set_shards(tuple(new_items))
-        except Exception:
+        except BaseException:
             for connection in reversed(opened):
-                connection.close()
+                if id(connection) not in self._borrowed_connection_ids:
+                    try:connection.close()
+                    except BaseException:pass
             raise
 
         try:
@@ -245,11 +257,13 @@ class LiveCatalog:
                 self._store.record_catalog_refresh(
                     self._account_id, self._source_generation, discovered
                 )
-        except Exception:
+        except BaseException:
             self._shards = previous
-            self._set_shards(previous)
+            self._routes = previous_routes
             for connection in reversed(opened):
-                connection.close()
+                if id(connection) not in self._borrowed_connection_ids:
+                    try:connection.close()
+                    except BaseException:pass
             raise
 
         current_paths = {shard.path for shard in self._shards}
@@ -257,7 +271,8 @@ class LiveCatalog:
             shard for shard in previous if shard.path not in current_paths
         ]
         for shard in disappeared:
-            shard.connection.close()
+            if id(shard.connection) not in self._borrowed_connection_ids:
+                shard.connection.close()
         return CatalogRefreshResult(
             shard_count=len(self._shards),
             table_count=len(self._routes),
@@ -300,7 +315,12 @@ class LiveCatalog:
 
     def close(self) -> None:
         if self._owns_connections:
+            failure = None
             for shard in reversed(self._shards):
-                shard.connection.close()
+                if id(shard.connection) not in self._borrowed_connection_ids:
+                    try:shard.connection.close()
+                    except BaseException as error:
+                        if failure is None:failure = error
             self._shards = ()
             self._routes = {}
+            if failure is not None:raise failure

@@ -361,7 +361,7 @@ class LiveIdentityAdapter:
     def contact_source_status(self) -> str:
         return self._contact_status_and_epoch()[0]
 
-    def resolve_contact(self, query: str, *, limit: int = 20) -> tuple[dict[str, Any], tuple | None]:
+    def resolve_contact(self, query: str, *, limit: int = 20, _kind: str | None = None) -> tuple[dict[str, Any], tuple | None]:
         """Resolve against the already-open current contact source, without history."""
         value = normalize(query)
         if not value:
@@ -371,6 +371,8 @@ class LiveIdentityAdapter:
             return {'status': 'unavailable', 'reason': 'contact_source_' + status}, None
         buckets: dict[str, list[dict[str, Any]]] = {'username': [], 'exact': [], 'partial': []}
         counts = {name: 0 for name in buckets}
+        other_kind_exact = False
+        public_exact = False
         try:
             cursor = self.contact_connection.execute('SELECT username, alias, remark, nick_name FROM contact')
             while True:
@@ -383,6 +385,15 @@ class LiveIdentityAdapter:
                     item = {key: value if isinstance(value, str) else '' for key, value in zip(('username','alias','remark','nick_name'), row)}
                     item['display_name'] = _display_name(item)
                     exact = _matched_fields(item, value, exact=True)
+                    wrong_group = _kind == 'group' and not row[0].endswith('@chatroom')
+                    wrong_private = _kind == 'private' and (row[0].endswith('@chatroom') or row[0].startswith('gh_'))
+                    if wrong_group or wrong_private:
+                        if normalize(row[0]) == value or exact:
+                            if row[0].startswith('gh_'):
+                                public_exact = True
+                            else:
+                                other_kind_exact = True
+                        continue
                     partial = _matched_fields(item, value, exact=False) if len(value) >= 2 else []
                     for name, fields in (('username', ['username'] if normalize(item['username']) == value else []), ('exact', exact), ('partial', partial)):
                         if fields:
@@ -410,6 +421,11 @@ class LiveIdentityAdapter:
                 return {'status': 'unavailable', 'reason': 'contact_identity_conflict'}, None
         except Exception:
             return {'status': 'unavailable', 'reason': 'contact_source_unavailable'}, None
+        if not counts['username'] and not counts['exact'] and other_kind_exact:
+            return {'status': 'unavailable', 'reason': 'contact_target_type_mismatch',
+                    'hint': 'group-query' if _kind == 'private' else 'contact-query'}, epoch
+        if not counts['username'] and not counts['exact'] and public_exact and _kind == 'private':
+            return {'status': 'unavailable', 'reason': 'contact_target_unsupported'}, epoch
         if counts['username']:
             kind, basis = 'username', 'exact_username'
         elif counts['exact']:

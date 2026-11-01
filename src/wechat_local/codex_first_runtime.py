@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 _WINDOW_SHARD_WORKERS = 2
 
 from .agent_store import AgentStore, AgentStoreError
+from .attachment_resolver import AttachmentResolver
 from .codex_first import (
     CodexFirstError,
     CodexFirstService,
@@ -39,6 +40,7 @@ from .codex_first import (
 from .event_search_projection import (
     EventSearchService,
     ProjectionWorker,
+    ProjectionError,
     SearchPage,
     _project_materialization,
 )
@@ -78,6 +80,10 @@ PREFLIGHT_SAMPLE_LIMIT = 10_001
 
 class ContactQueryError(CodexFirstError):
     """A fixed, content-free contact-resolution failure."""
+
+
+class _ContactOnlyCatalog:
+    shards = ()
 
 
 def _inclusive_source_seconds(window: TimeWindow) -> tuple[int, int]:
@@ -218,6 +224,7 @@ class CodexFirstRuntime:
         capability_check: CapabilityCheck = inspect_source_capabilities,
         voice_enricher: VoiceTranscriptEnricher | None = None,
         image_enricher: ImageEnricher | None = None,
+        attachment_resolver: AttachmentResolver | None = None,
         source_filter: SourceFilter | None = None,
         batch_size: int = 500,
         projection_batch_size: int = 100,
@@ -255,6 +262,7 @@ class CodexFirstRuntime:
         self.capability_check = capability_check
         self.voice_enricher = voice_enricher
         self.image_enricher = image_enricher
+        self.attachment_resolver = attachment_resolver
         self.source_filter = source_filter
         self.batch_size = batch_size
         self.projection_batch_size = projection_batch_size
@@ -280,6 +288,8 @@ class CodexFirstRuntime:
         # Only the public encrypted-catalog path opts into exclusive handoff.
         self._scan_workers = 1
         self._empty_window_enabled = False
+        self._latest_ids = None
+        self._latest_source_state = None
         for shard in catalog.shards:
             try:
                 info = shard.path.lstat()
@@ -329,6 +339,10 @@ class CodexFirstRuntime:
             return (id(shard.connection), version, tuple(stamps))
         except Exception:
             return None
+
+    def _ensure_latest_source_state(self) -> None:
+        if self._latest_source_state is None or self._source_state() != self._latest_source_state:
+            raise ContactQueryError('source_changed')
 
     def _parallel_window_reads(self, sources, included, start, end):
         """Read per physical shard, with no main-thread connection access until join."""
@@ -397,12 +411,16 @@ class CodexFirstRuntime:
                     empty, no_future = _empty_window_probe(shard.connection, source.table_name, start=start, end=end) if can_prove else (False, False)
                     if cancelled.is_set():
                         break
-                    read = (WindowReadResult([], None, None, 0, None) if empty else
+                    if self._latest_ids is not None:
+                        self._ensure_latest_source_state()
+                    selected_ids = self._latest_ids.get(source) if self._latest_ids is not None else None
+                    read = (WindowReadResult([], None, None, 0, None) if empty or selected_ids == () else
                         read_message_window(
                             shard.connection, source.table_name,
                             start_unix_seconds=start, end_unix_seconds=end,
                             batch_size=self.batch_size, _cancelled=cancelled.is_set,
                             **({'_sender_id': self._scope_senders[source]} if source in self._scope_senders else {}),
+                            **({'_local_ids': selected_ids} if selected_ids is not None else {}),
                             **({'collect_voice_packed': True} if self.voice_enricher is not None else {}),
                         ))
                     epoch = before if before is not None and before == self._voice_epoch(shard) else None
@@ -584,6 +602,48 @@ class CodexFirstRuntime:
         if any(self._voice_epoch(shard) != epoch for shard,epoch in self._scope_epochs.values()):
             raise LiveReadonlyError('Live message source changed')
         self._scope_allowed = allowed
+
+    def _latest_candidates(self, sources, limit):
+        """Select bounded metadata under each source's pinned identity snapshot."""
+        candidates = []
+        for source in sources:
+            shard = self.catalog.shard_for_source(source)
+            if shard is None or source not in self._scope_private:
+                raise ContactQueryError('latest_source_unavailable')
+            epoch = self._scope_epochs.get(id(shard.connection))
+            if epoch is None or self._voice_epoch(shard) != epoch[1]:
+                raise ContactQueryError('source_changed')
+            connection = shard.connection
+            connection.execute('BEGIN')
+            try:
+                if _username_for_table(connection, source.table_name) != self._contact_target:
+                    raise ContactQueryError('source_changed')
+                if self._voice_epoch(shard) != epoch[1]:
+                    raise ContactQueryError('source_changed')
+                quoted = '"' + source.table_name.replace('"', '""') + '"'
+                invalid = connection.execute(
+                    f"SELECT 1 FROM {quoted} WHERE typeof(local_id)<>'integer' OR typeof(create_time)<>'integer' OR create_time < {SOURCE_TIMESTAMP_LOWER_BOUND} OR create_time >= {SOURCE_TIMESTAMP_UPPER_BOUND} LIMIT 1").fetchone()
+                if invalid:
+                    raise ContactQueryError('latest_order_unavailable')
+                rows = connection.execute(
+                    f'SELECT local_id,create_time FROM {quoted} ORDER BY create_time DESC,local_id DESC LIMIT ?',
+                    (limit,)).fetchall()
+                if any(type(row[0]) is not int or type(row[1]) is not int for row in rows):
+                    raise ContactQueryError('latest_order_unavailable')
+                candidates.extend((timestamp, source.shard_name, source.table_name, local_id, source)
+                                  for local_id, timestamp in rows)
+            finally:
+                connection.rollback()
+            if self._voice_epoch(shard) != epoch[1]:
+                raise ContactQueryError('source_changed')
+        candidates.sort(key=lambda item: item[:4], reverse=True)
+        selected = candidates[:limit]
+        ids = {source: [] for source in sources}
+        for _, _, _, local_id, source in selected:
+            ids[source].append(local_id)
+        if any(len(set(values)) != len(values) for values in ids.values()):
+            raise ContactQueryError('latest_source_unavailable')
+        return {source: tuple(values) for source, values in ids.items()}, selected
 
     def preflight(self, window: TimeWindow) -> QueryPreflight:
         if not isinstance(window, TimeWindow):
@@ -960,6 +1020,24 @@ class CodexFirstRuntime:
             groups.append(replace(group, messages=tuple(messages)))
         return replace(result, groups=tuple(groups))
 
+    def _resolve_visible_attachments(self, result, contexts):
+        if self.attachment_resolver is None:
+            return result
+        groups = []
+        for group in result.groups:
+            messages = []
+            for displayed in group.messages:
+                context = contexts.get(displayed.event_id)
+                if context is None or displayed.content_kind != 'file':
+                    messages.append(displayed)
+                    continue
+                if self._contact_guard is not None:
+                    self._contact_guard()
+                attachment = self.attachment_resolver.resolve(*context)
+                messages.append(replace(displayed, event_ref={**displayed.event_ref, 'attachment': attachment}))
+            groups.append(replace(group, messages=tuple(messages)))
+        return replace(result, groups=tuple(groups))
+
     def scan(
         self,
         window: TimeWindow,
@@ -971,6 +1049,7 @@ class CodexFirstRuntime:
         on_base_messages: BaseMessagesCallback | None = None,
         on_voice_result: VoiceResultCallback | None = None,
         on_image_result: ImageResultCallback | None = None,
+        _latest_limit: int | None = None,
     ) -> ScanResult:
         if not isinstance(window, TimeWindow):
             raise TypeError("window must be a TimeWindow")
@@ -987,15 +1066,34 @@ class CodexFirstRuntime:
                 raise TypeError(f"{name} must be callable")
 
         self._query_failures = []
+        self._latest_ids = None
+        self._latest_source_state = self._source_state() if _latest_limit is not None else None
+        if _latest_limit is not None:
+            self._ensure_latest_source_state()
         self._request_preflight = None
         self._request_preflight_state = None
         self._request_preflight_window = None
         if self.scan_start is not None:
             self.scan_start()
+        if _latest_limit is not None:
+            self._ensure_latest_source_state()
         if self._contact_target is not None or self._conversation_target is not None:
             if self._contact_guard is not None:
                 self._contact_guard()
             self._prepare_contact_scope(window)
+            if _latest_limit is not None:
+                self._ensure_latest_source_state()
+            if self._contact_guard is not None:
+                self._contact_guard()
+        latest_ids = None
+        if _latest_limit is not None:
+            latest_sources = self._sources()
+            latest_ids, selected = self._latest_candidates(latest_sources, _latest_limit)
+            self._ensure_latest_source_state()
+            self._latest_ids = latest_ids
+            if selected:
+                window = TimeWindow.from_utc(datetime.fromtimestamp(selected[-1][0], timezone.utc),
+                                             datetime.fromtimestamp(selected[0][0], timezone.utc), 'latest')
             if self._contact_guard is not None:
                 self._contact_guard()
         start_seconds, end_seconds = _inclusive_source_seconds(window)
@@ -1016,7 +1114,7 @@ class CodexFirstRuntime:
             if on_base_messages is not None:
                 on_base_messages(result)
             return result
-        if (window.end - window.start).total_seconds() > LARGE_QUERY_SECONDS:
+        if _latest_limit is None and (window.end - window.start).total_seconds() > LARGE_QUERY_SECONDS:
             before = self._source_state()
             preflight = self.preflight(window)
             after = self._source_state()
@@ -1029,7 +1127,11 @@ class CodexFirstRuntime:
                 return ScanResult((), coverage, 0, "confirmation_required", "confirmation_required")
 
         self.catalog.refresh_catalog()
+        if latest_ids is not None:
+            self._ensure_latest_source_state()
         sources = self._sources()
+        if latest_ids is not None and set(sources) != set(latest_ids):
+            raise ContactQueryError('source_changed')
         if not sources:
             missing = [
                 source
@@ -1174,10 +1276,14 @@ class CodexFirstRuntime:
                 if checked[identity] != expected:
                     return False
             return True
+        if latest_ids is not None:
+            self._ensure_latest_source_state()
         parallel_reads = (
             self._parallel_window_reads(sources, worker_included, start_seconds, end_seconds)
-            if self._scan_workers > 1 or self._empty_window_enabled else None
+            if self._scan_workers > 1 or self._empty_window_enabled or latest_ids is not None else None
         )
+        if latest_ids is not None:
+            self._ensure_latest_source_state()
         if any(self._voice_epoch(shard) != epoch for shard,epoch in self._scope_epochs.values()):
             return self._unavailable(self._coverage(window, minimums, maximums, [*gaps, 'source_changed']), 'source_changed')
         if self._contact_guard is not None:
@@ -1235,6 +1341,12 @@ class CodexFirstRuntime:
                 if read.invalid_timestamp_count is None:
                     gaps.append("timestamp_integrity_unknown_outside_requested_window")
                 messages = list(read.messages)
+                if latest_ids is not None:
+                    expected = {(local_id, timestamp) for timestamp, _, _, local_id, key in selected if key == source}
+                    if {(message.local_id, message.create_time) for message in messages} != expected or len(messages) != len(expected):
+                        raise LiveReadonlyError('Latest source changed')
+                    if not expected:
+                        continue
                 if (
                     evidence.direction_for_message is None
                     and evidence.direction_proven
@@ -1268,6 +1380,10 @@ class CodexFirstRuntime:
                         gaps.append('baseline_state_unavailable')
                 scanned_messages.append((source, messages))
             except Exception as error:
+                if latest_ids is not None:
+                    reason = 'source_read_unavailable' if failure_stage == 'source_read' else 'result_processing_unavailable'
+                    self._query_failures.append({'stage': failure_stage, 'reason': _diagnostic_reason(error)})
+                    return self._unavailable(self._coverage(window, minimums, maximums, [*gaps, reason]), reason)
                 # Preserve the existing gap and only fixed, content-free facts.
                 failure = {"stage": failure_stage, "reason": _diagnostic_reason(error)}
                 if failure not in self._query_failures:
@@ -1305,27 +1421,30 @@ class CodexFirstRuntime:
         if any(self._voice_epoch(shard) is None for shard in self.catalog.shards):
             return self._unavailable(self._coverage(window, minimums, maximums, [*gaps, "source_changed"]), "source_changed")
 
-        if self._contact_target is None and self._conversation_target is None:
-            self._project()
-        else:
-            worker = NormalizationWorker(self.event_store, 'codex-first-' + secrets.token_hex(8))
-            selected_materializations = []
-            profile = ProjectionProfile()
-            for source, messages in scanned_messages:
-                for outbox_id in self.event_store._exact_window_outboxes(source, messages):
-                    outcome = worker.process_exact(outbox_id)
-                    if outcome.outcome not in ('normalized', 'degraded'):
-                        raise EventStoreError('Selected normalization unavailable')
-                exact = self.event_store.standard_event_materializations_for_messages(
-                    source, messages, contract_version=profile.contract_version,
-                    normalizer_name=profile.normalizer_name, normalizer_version=profile.normalizer_version,
-                    _exact=True,
-                )
-                if len(exact) != len(messages):
-                    raise EventStoreError('Selected materialization unavailable')
-                selected_materializations.extend(exact.values())
-            with StandardEventRepository(self.event_store.path) as repository:
-                ProjectionWorker(repository, self.agent_store).run_exact(selected_materializations)
+        worker = NormalizationWorker(self.event_store, 'codex-first-' + secrets.token_hex(8))
+        selected_materializations = []
+        profile = ProjectionProfile()
+        for source, messages in scanned_messages:
+            for outbox_id in self.event_store._exact_window_outboxes(source, messages):
+                outcome = worker.process_exact(outbox_id)
+                if outcome.outcome not in ('normalized', 'degraded'):
+                    raise EventStoreError('Selected normalization unavailable')
+            exact = self.event_store.standard_event_materializations_for_messages(
+                source, messages, contract_version=profile.contract_version,
+                normalizer_name=profile.normalizer_name, normalizer_version=profile.normalizer_version,
+                _exact=True,
+            )
+            if len(exact) != len(messages):
+                raise EventStoreError('Selected materialization unavailable')
+            selected_materializations.extend(exact.values())
+        # run_exact never reads from the repository or advances its global checkpoint.
+        try:
+            ProjectionWorker(None, self.agent_store).run_exact(selected_materializations)
+        except ProjectionError:
+            if self._contact_target is not None or self._conversation_target is not None:
+                raise
+            # The ordinary path historically reported a projection gap for stale rows.
+            gaps.append('event_projection_unavailable')
         try:
             contributing = {id(self.catalog.shard_for_source(source).connection)
                             for source,messages in scanned_messages if messages
@@ -1371,7 +1490,7 @@ class CodexFirstRuntime:
                 contract_version=profile.contract_version,
                 normalizer_name=profile.normalizer_name,
                 normalizer_version=profile.normalizer_version,
-                **({'_exact': True} if self._contact_target is not None or self._conversation_target is not None else {}),
+                _exact=True,
                 **({'_by_local_id': by_local_id} if has_voice else {}),
             )
             overlap = materializations.keys() & resolved.keys()
@@ -1447,7 +1566,19 @@ class CodexFirstRuntime:
             return self._unavailable(self._coverage(window, minimums, maximums, [*gaps, 'source_changed']), 'source_changed')
         if association_epoch != self._association_store_epoch() or any(self._voice_epoch(shard) != epoch for shard,epoch in association_source_epochs):
             return self._unavailable(self._coverage(window, minimums, maximums, [*gaps,'conversation_attribution_unavailable']), 'conversation_attribution_unavailable')
+        if self.attachment_resolver is not None:
+            rendered = self._resolve_visible_attachments(rendered, message_contexts)
+            if not reused_is_stable() or not max_empty_is_stable():
+                return self._unavailable(self._coverage(window, minimums, maximums, [*gaps, 'source_changed']), 'source_changed')
+            if association_epoch != self._association_store_epoch() or any(self._voice_epoch(shard) != epoch for shard,epoch in association_source_epochs):
+                return self._unavailable(self._coverage(window, minimums, maximums, [*gaps,'conversation_attribution_unavailable']), 'conversation_attribution_unavailable')
+            if self._contact_guard is not None:
+                self._contact_guard()
         if on_base_messages is not None:
+            if latest_ids is not None:
+                self._ensure_latest_source_state()
+            if latest_ids is not None and any(self._voice_epoch(shard) != epoch for shard, epoch in self._scope_epochs.values()):
+                return self._unavailable(self._coverage(window, minimums, maximums, [*gaps, 'source_changed']), 'source_changed')
             on_base_messages(rendered)
         rendered = self._enrich_visible_images(
             rendered, message_contexts, on_image_result=on_image_result
@@ -1463,6 +1594,10 @@ class CodexFirstRuntime:
                     "state_unavailable" if voice_epoch is None or current_epoch is None else "state_changed"
                 )})
                 rendered = replace(rendered, coverage=self._coverage(window, minimums, maximums, gaps))
+        if latest_ids is not None and any(self._voice_epoch(shard) != epoch for shard, epoch in self._scope_epochs.values()):
+            return self._unavailable(self._coverage(window, minimums, maximums, [*gaps, 'source_changed']), 'source_changed')
+        if latest_ids is not None:
+            self._ensure_latest_source_state()
         return self._enrich_visible_voices(
             rendered, voice_contexts, evidence, on_voice_result=on_voice_result
         )
@@ -1543,9 +1678,13 @@ def build_parser() -> argparse.ArgumentParser:
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--conversation-username", help="exact Name2Id username; restricts sources before preflight and content reads")
     target.add_argument("--contact-query", help="resolve a current contact by username, remark, nickname or alias")
+    target.add_argument("--group-query", help="resolve a group name to its stable conversation")
     parser.add_argument("--include-related-groups", action="store_true", help="include this contact's own messages in verified groups")
     parser.add_argument("--locate-related-groups", action="store_true", help="locate groups with this contact's messages without reading message content")
-    parser.add_argument("--request")
+    when = parser.add_mutually_exclusive_group()
+    when.add_argument("--request")
+    when.add_argument("--latest", nargs='?', const=20, type=int, choices=range(1, 101),
+                      metavar='N', help='latest 1–100 messages in the resolved private conversation (default 20)')
     parser.add_argument("--timezone")
     parser.add_argument("--check-config", action="store_true")
     parser.add_argument("--display-limit", type=int, default=50)
@@ -1561,23 +1700,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-key-config", type=Path, help="private JSON file with account_scope and key_codes")
     parser.add_argument("--image-ffmpeg", type=Path)
     parser.add_argument("--configured-images", action="store_true", help="opt in to image sources recorded by --source-config")
+    parser.add_argument('--file-attachments-root', type=Path,
+                        help='opt in to read-only document, spreadsheet, presentation and archive location within this account; no download or parsing')
     parser.add_argument("--confirmation-token", help="confirmation token for the same fixed absolute large-window request")
     parser.add_argument("--json", action="store_true")
     return parser
 
 
+def _attachment_resolver_for_args(args, live_db_root):
+    path = args.file_attachments_root
+    if path is None:
+        return None
+    root = Path(path).absolute()
+    account = live_db_root.parent.resolve()
+    if root == account or not root.is_relative_to(account) or root.is_relative_to(live_db_root):
+        raise ValueError('attachment_root_outside_account')
+    return AttachmentResolver(root, account_id=args.account_id, source_generation=args.source_generation)
+
+
 def _run_cli(args: argparse.Namespace) -> int:
     args._diagnostic_stage = "configuration"
+    if args.latest is not None and (args.contact_query is None or args.include_related_groups or args.check_config):
+        raise ContactQueryError('latest_requires_private_contact')
     if args.locate_related_groups:
         if args.contact_query is None or not args.include_related_groups:
             raise ContactQueryError('locate_requires_contact_and_groups')
-        if args.check_config or args.voice_transcripts or args.voice_database or args.voice_runtime_root or args.voice_python or args.configured_images or args.image_database or args.image_attachments_root or args.image_output_root or args.image_key_config or args.image_ffmpeg:
+        if args.check_config or args.voice_transcripts or args.voice_database or args.voice_runtime_root or args.voice_python or args.configured_images or args.image_database or args.image_attachments_root or args.image_output_root or args.image_key_config or args.image_ffmpeg or args.file_attachments_root:
             raise ContactQueryError('locate_media_or_check_unsupported')
     if args.include_related_groups and args.contact_query is None:
         raise ContactQueryError('contact_query_required')
-    if args.contact_query is not None and not args.contact_query.strip():
+    name_query = args.contact_query if args.contact_query is not None else args.group_query
+    if name_query is not None and not name_query.strip():
         raise ContactQueryError('contact_query_empty')
-    if args.check_config and args.contact_query is not None:
+    if args.check_config and name_query is not None:
         raise ContactQueryError('contact_query_with_check_config')
     apply_source_config_to_args(args)
     if any(
@@ -1646,11 +1801,12 @@ def _run_cli(args: argparse.Namespace) -> int:
         result = {"status": "ready", "query_only": True, "shard_count": len(checked)}
         print(json.dumps(result, sort_keys=True) if args.json else "CONFIGURATION_READY")
         return 0
-    if not args.account_id or not args.source_generation or not args.request or not args.timezone:
+    if not args.account_id or not args.source_generation or (not args.request and args.latest is None) or not args.timezone:
         raise LiveReadonlyError("Account, source generation, request and timezone are required for a query")
-    window = parse_time_window(
+    now = datetime.now(timezone.utc)
+    window = TimeWindow.from_utc(now, now, 'latest') if args.latest is not None else parse_time_window(
         args.request,
-        now=datetime.now(timezone.utc),
+        now=now,
         timezone=ZoneInfo(args.timezone),
     )
     catalog = None
@@ -1662,7 +1818,72 @@ def _run_cli(args: argparse.Namespace) -> int:
     contact_source_unavailable = False
     voice_source_unavailable = bool(getattr(args, "voice_source_unavailable", False))
     image_source_unavailable = bool(getattr(args, "configured_image_unavailable", False))
+    target_resolution = None
+    contact_epoch = None
+    resolved_contact_path = None
+    preopened = None
     try:
+        if name_query is not None:
+            # Resolve against the current contact source before opening message shards.
+            try:
+                if args.contact_database is not None:
+                    contact_path = args.contact_database
+                    if contact_path.is_symlink() or not contact_path.is_file():
+                        raise OSError('contact source unavailable')
+                    before = contact_path.lstat()
+                    contact_connection = sqlite3.connect(readonly_database_uri(contact_path), uri=True)
+                    contact_connection_owned = True
+                    contact_connection.execute('PRAGMA query_only=ON')
+                    info = contact_path.lstat()
+                elif args.encrypted_contact_database is not None:
+                    contact_path = args.encrypted_contact_database
+                    resolved_contact_path = contact_path.resolve(strict=True)
+                    resolved_contact_path.relative_to(root)
+                    if contact_path.is_symlink() or not resolved_contact_path.is_file():
+                        raise OSError('contact source unavailable')
+                    before = resolved_contact_path.lstat()
+                    if not stat.S_ISREG(before.st_mode):
+                        raise OSError('contact source unavailable')
+                    contact_connection, _ = open_encrypted_readonly(resolved_contact_path, passphrase, _thread_handoff=True)
+                    contact_connection_owned = True
+                    info = resolved_contact_path.lstat()
+                else:
+                    before = info = None
+                if before is not None and (not stat.S_ISREG(info.st_mode) or (before.st_dev,before.st_ino)!=(info.st_dev,info.st_ino)):
+                    raise OSError('contact source changed')
+            except Exception:
+                if contact_connection is not None and contact_connection_owned:
+                    contact_connection.close()
+                contact_connection = None
+                contact_connection_owned = False
+                contact_source_unavailable = True
+            early_identity = LiveIdentityAdapter(_ContactOnlyCatalog(), contact_connection=contact_connection,
+                                                 contact_source_unavailable=contact_source_unavailable)
+            if contact_connection is not None:
+                early_identity._initial_shards[id(contact_connection)] = (info.st_dev,info.st_ino)
+            early_identity.begin_scan()
+            target_resolution, contact_epoch = early_identity.resolve_contact(name_query, _kind='private' if args.contact_query is not None else 'group')
+            if (args.contact_query is not None and args.contact_query.strip().endswith('@chatroom')
+                    and target_resolution['status'] in ('not_found', 'suggestions')):
+                target_resolution = {'status':'unavailable', 'reason':'contact_target_type_mismatch', 'hint':'group-query'}
+            args._target_resolution = target_resolution
+            state = target_resolution['status']
+            if state == 'resolved':
+                selected = target_resolution['selected_username']
+                if args.contact_query is not None and (selected.endswith('@chatroom') or selected.startswith('gh_')):
+                    raise ContactQueryError('contact_target_unsupported')
+                if args.group_query is not None:
+                    args.conversation_username = selected
+            else:
+                code = 3 if state == 'ambiguous' else 2
+                result = {'status': state, 'target_resolution': target_resolution}
+                if state == 'unavailable':result['error_code'] = target_resolution['reason']
+                if args.voice_jsonl:args._stream_completion = {'phase': 'complete', **result}
+                else:args._contact_resolution_output = result
+                return code
+            if resolved_contact_path is not None and resolved_contact_path in source_paths:
+                preopened = {resolved_contact_path: contact_connection}
+        attachment_resolver = _attachment_resolver_for_args(args, root)
         resolved_voice_paths = tuple(path.resolve() for path in args.voice_database)
         if len(set(resolved_voice_paths)) != len(resolved_voice_paths):
             raise LiveReadonlyError("Voice database paths must be unique")
@@ -1678,6 +1899,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                 account_id=args.account_id,
                 source_generation=args.source_generation,
                 _thread_handoff=True,
+                **({'_preopened': preopened} if preopened is not None else {}),
             )
             catalog_identities = {}
             for shard in catalog.shards:
@@ -1712,6 +1934,15 @@ def _run_cli(args: argparse.Namespace) -> int:
                         unavailable_source_paths.add(path)
                         continue
                     borrowed_voice_paths[path] = (id(shared), info.st_dev, info.st_ino)
+                    continue
+                if (name_query is not None and resolved_contact_path == path and contact_connection is not None):
+                    info = path.lstat()
+                    if not stat.S_ISREG(info.st_mode) or (info.st_dev,info.st_ino) != early_identity._initial_shards.get(id(contact_connection)):
+                        voice_source_unavailable = True
+                        unavailable_source_paths.add(path)
+                        continue
+                    owned_voice_paths[path] = contact_connection
+                    owned_voice_identities[path] = (info.st_dev,info.st_ino)
                     continue
                 connection = None
                 try:
@@ -1805,7 +2036,12 @@ def _run_cli(args: argparse.Namespace) -> int:
             )
             for connection_id, device, inode in catalog_identities.values():
                 identity._initial_shards[connection_id] = (device, inode)
-            if args.contact_database is not None:
+            if name_query is not None:
+                identity.contact_connection = contact_connection
+                identity.contact_source_unavailable = contact_source_unavailable
+                if contact_connection is not None:
+                    identity._initial_shards[id(contact_connection)] = early_identity._initial_shards[id(contact_connection)]
+            elif args.contact_database is not None:
                 contact_path = args.contact_database
                 try:
                     if contact_path.is_symlink() or not contact_path.is_file():
@@ -1857,27 +2093,6 @@ def _run_cli(args: argparse.Namespace) -> int:
                         unavailable_source_paths.add(resolved_contact_path)
                     contact_source_unavailable = True
                     identity.contact_source_unavailable = True
-            target_resolution = None
-            contact_epoch = None
-            if args.contact_query is not None:
-                identity.begin_scan()
-                target_resolution, contact_epoch = identity.resolve_contact(args.contact_query)
-                args._target_resolution = target_resolution
-                state = target_resolution['status']
-                if state == 'resolved':
-                    selected = target_resolution['selected_username']
-                    if selected.endswith('@chatroom') or selected.startswith('gh_'):
-                        raise ContactQueryError('contact_target_unsupported')
-                else:
-                    code = 3 if state == 'ambiguous' else 2
-                    result = {'status': state, 'target_resolution': target_resolution}
-                    if state == 'unavailable':
-                        result['error_code'] = target_resolution['reason']
-                    if args.voice_jsonl:
-                        args._stream_completion = {'phase': 'complete', **result}
-                    else:
-                        args._contact_resolution_output = result
-                    return code
 
             def ensure_contact_stable() -> None:
                 if contact_epoch is not None and (identity.contact_connection is None or identity._epoch(identity.contact_connection) != contact_epoch):
@@ -2029,8 +2244,9 @@ def _run_cli(args: argparse.Namespace) -> int:
                 capability_check=lambda _catalog: identity.evidence(),
                 voice_enricher=voice_enricher,
                 image_enricher=image_enricher,
+                attachment_resolver=attachment_resolver,
                 source_filter=(
-                    selected_source if target_resolution is not None else
+                    selected_source if args.contact_query is not None else
                     (lambda source: identity.matches_conversation(source, args.conversation_username))
                     if args.conversation_username else None
                 ),
@@ -2044,7 +2260,7 @@ def _run_cli(args: argparse.Namespace) -> int:
             if args.conversation_username is not None:
                 runtime._conversation_target = args.conversation_username
                 runtime._contact_guard = ensure_contact_stable
-            if target_resolution is not None:
+            if args.contact_query is not None:
                 runtime._contact_target = target_resolution['selected_username']
                 runtime._contact_related = args.include_related_groups
                 runtime._contact_unknown_sources = unknown_sources
@@ -2093,9 +2309,25 @@ def _run_cli(args: argparse.Namespace) -> int:
                     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
                 return 0
 
+            def ensure_latest_stable():
+                if args.latest is not None:
+                    runtime._ensure_latest_source_state()
+                    if any(runtime._voice_epoch(shard) != epoch for shard, epoch in runtime._scope_epochs.values()):
+                        raise ContactQueryError('source_changed')
+
+            def mark_latest(payload):
+                if args.latest is not None:
+                    payload['selected_time_bounds'] = payload['requested'] if payload['total_count'] else {'start': None, 'end': None}
+                    payload['requested'] = {'start': None, 'end': None}
+                    payload['query_mode'] = {'kind': 'latest', 'limit': args.latest,
+                                             'same_second_order': 'not_guaranteed',
+                                             'scope': 'configured_current_sources'}
+
             def emit_messages(initial: ScanResult) -> None:
                 ensure_contact_stable()
+                ensure_latest_stable()
                 initial_payload = _result_payload(initial)
+                mark_latest(initial_payload)
                 if target_resolution is not None:
                     initial_payload['target_resolution'] = target_resolution
                 if runtime._query_failures:
@@ -2112,6 +2344,7 @@ def _run_cli(args: argparse.Namespace) -> int:
 
             def emit_voice(event_id: str, voice: Mapping[str, Any]) -> None:
                 ensure_contact_stable()
+                ensure_latest_stable()
                 print(
                     json.dumps(
                         {"phase": "voice", "event_id": event_id, "voice": voice},
@@ -2123,6 +2356,7 @@ def _run_cli(args: argparse.Namespace) -> int:
 
             def emit_image(event_id: str, image: Mapping[str, Any]) -> None:
                 ensure_contact_stable()
+                ensure_latest_stable()
                 print(
                     json.dumps(
                         {"phase": "image", "event_id": event_id, "image": image},
@@ -2134,29 +2368,37 @@ def _run_cli(args: argparse.Namespace) -> int:
 
             result = runtime.scan(
                 window,
-                display_limit=args.display_limit,
+                display_limit=max(args.display_limit, args.latest or 0),
                 confirmation_token=args.confirmation_token,
                 on_base_messages=emit_messages if args.voice_jsonl else None,
                 on_voice_result=emit_voice if args.voice_jsonl else None,
                 on_image_result=emit_image if args.voice_jsonl else None,
+                _latest_limit=args.latest,
             )
             ensure_contact_stable()
+            ensure_latest_stable()
             payload = _result_payload(result)
+            mark_latest(payload)
             if target_resolution is not None:
                 payload['target_resolution'] = target_resolution
             if runtime._query_failures:
                 payload["diagnostics"] = {"failures": list(runtime._query_failures)}
             payload["contact_name_source"] = identity.contact_source_status()
+            output_contact_epoch = getattr(identity, '_contact_schema_epoch', None)
             preflight = runtime.output_preflight(window) if result.status != 'unavailable' else None
             confirmation = _confirmation_payload(preflight, window, args.timezone) if preflight is not None else None
             ensure_contact_stable()
+            ensure_latest_stable()
             if args.voice_jsonl:
+                if output_contact_epoch is not None and (identity.contact_connection is None or identity._epoch(identity.contact_connection) != output_contact_epoch):
+                    raise ContactQueryError('contact_source_changed')
                 args._stream_completion = {
                     "phase": "complete",
                     "status": result.status,
                     **({'error_code': result.error_code, 'gaps': list(result.coverage.gaps)} if result.status == 'unavailable' else {}),
                     "confirmation": confirmation,
-                    "contact_name_source": identity.contact_source_status(),
+                    "contact_name_source": payload["contact_name_source"],
+                    **({'query_mode': payload['query_mode']} if args.latest is not None else {}),
                     **({'target_resolution': target_resolution} if target_resolution is not None else {}),
                     **({"diagnostics": {"failures": list(runtime._query_failures)}} if runtime._query_failures else {}),
                 }
@@ -2166,6 +2408,8 @@ def _run_cli(args: argparse.Namespace) -> int:
                 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             else:
                 print("CODEX_FIRST_SCAN " + result.status.upper())
+                if args.latest is not None:
+                    print('QUERY_MODE latest; same-second order is not guaranteed')
                 if confirmation is not None:
                     print("CONFIRMATION_REQUIRED " + json.dumps(confirmation, ensure_ascii=False, sort_keys=True))
                 print(
@@ -2189,14 +2433,23 @@ def _run_cli(args: argparse.Namespace) -> int:
                     print(json.dumps(group, ensure_ascii=False, sort_keys=True))
             return 0
     finally:
-        for connection in voice_connections:
-            connection.close()
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error = None
+        closers = [connection.close for connection in voice_connections]
         if image_connection is not None and image_connection_owned:
-            image_connection.close()
-        if contact_connection is not None and contact_connection_owned:
-            contact_connection.close()
+            closers.append(image_connection.close)
         if catalog is not None:
-            catalog.close()
+            closers.append(catalog.close)
+        if contact_connection is not None and contact_connection_owned:
+            closers.append(contact_connection.close)
+        for close in closers:
+            try:
+                close()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None and not active_error:
+            raise cleanup_error
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2214,7 +2467,7 @@ def main(argv: list[str] | None = None) -> int:
             args._stream_complete = True
         return result
     except ContactQueryError as error:
-        category = str(error) if str(error) in {'contact_query_required', 'contact_query_empty', 'contact_query_with_check_config', 'contact_source_changed', 'contact_target_unsupported', 'source_changed', 'locate_requires_contact_and_groups', 'locate_media_or_check_unsupported'} else 'contact_source_unavailable'
+        category = str(error) if str(error) in {'contact_query_required', 'contact_query_empty', 'contact_query_with_check_config', 'contact_source_changed', 'contact_target_unsupported', 'source_changed', 'locate_requires_contact_and_groups', 'locate_media_or_check_unsupported', 'latest_requires_private_contact', 'latest_order_unavailable', 'latest_source_unavailable'} else 'contact_source_unavailable'
         reason = category
         args._target_resolution = {'status': 'unavailable', 'reason': category}
     except SourceSetupError as error:
@@ -2237,7 +2490,7 @@ def main(argv: list[str] | None = None) -> int:
         category = "runtime_unavailable"
         reason = _diagnostic_reason(error)
     failure = {"stage": getattr(args, "_diagnostic_stage", "configuration"), "reason": reason}
-    if args.voice_jsonl and (getattr(args, '_stream_started', False) or args.contact_query is not None or args.conversation_username is not None or args.locate_related_groups) and not getattr(args, '_stream_complete', False):
+    if args.voice_jsonl and (getattr(args, '_stream_started', False) or args.contact_query is not None or args.group_query is not None or args.conversation_username is not None or args.locate_related_groups) and not getattr(args, '_stream_complete', False):
         print(json.dumps({'phase': 'complete', 'status': 'unavailable', 'error_code': category,
                           **({'target_resolution': args._target_resolution} if hasattr(args, '_target_resolution') else {}),
                           'diagnostics': {'failures': [failure]}}, sort_keys=True), flush=True)

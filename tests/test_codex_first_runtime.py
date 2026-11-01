@@ -136,6 +136,77 @@ class CodexFirstRuntimeTests(unittest.TestCase):
         self.assertIsNone(self.event_store.get_cursor(self.source))
         self.assertEqual(self.capability_checks, 1)
 
+    def test_attachment_reference_uses_existing_attributed_window_and_preserves_projection(self):
+        from wechat_local.attachment_resolver import AttachmentResolver
+        import hashlib
+        data = b'%PDF-1.7\nfixture'
+        files = self.root.resolve() / 'attachments'
+        files.mkdir()
+        path = files / 'report.pdf'
+        path.write_bytes(data)
+        xml = ('<msg><appmsg><type>6</type><title>report.pdf</title><appattach>'
+               f'<totallen>{len(data)}</totallen><md5>{hashlib.md5(data).hexdigest()}</md5>'
+               '</appattach></appmsg></msg>')
+        with sqlite3.connect(self.source_path) as source:
+            source.execute(f'UPDATE {TABLE} SET local_type=49,message_content=? WHERE local_id=2', (xml,))
+        runtime = self._runtime()
+        window = TimeWindow.from_utc(START, END)
+        without = runtime.scan(window, display_limit=50)
+        self.assertNotIn('attachment', without.groups[0].messages[0].event_ref)
+        runtime.attachment_resolver = AttachmentResolver(files, account_id='synthetic-account',
+                                                       source_generation='synthetic-generation')
+        first = runtime.scan(window, display_limit=50)
+        second = runtime.scan(window, display_limit=50)
+        ref = first.groups[0].messages[0].event_ref
+        self.assertEqual(ref['attachment']['status'], 'resolved')
+        self.assertEqual(ref['attachment']['path'], str(path))
+        self.assertEqual(first.groups[0].messages[0].event_id, without.groups[0].messages[0].event_id)
+        self.assertEqual(ref, second.groups[0].messages[0].event_ref)
+        self.assertNotIn('attachment', first.groups[0].messages[1].event_ref)
+        self.assertEqual(runtime.scan(window, display_limit=1, display_offset=1).total_messages, 2)
+        self.assertIsNone(self.event_store.get_cursor(self.source))
+
+    def test_attachment_cli_rejects_root_from_another_account_and_location_mode(self):
+        from wechat_local.codex_first_runtime import _attachment_resolver_for_args, build_parser
+        parser = build_parser()
+        args = parser.parse_args(['--file-attachments-root', str(self.root / 'another-account')])
+        with self.assertRaisesRegex(ValueError, 'attachment_root_outside_account'):
+            _attachment_resolver_for_args(args, self.root / 'selected-account' / 'db_storage')
+        payload = StringIO()
+        with redirect_stdout(payload):
+            exit_code = main(['--file-attachments-root', str(self.root), '--locate-related-groups',
+                              '--contact-query', 'fixture', '--include-related-groups', '--json'])
+        self.assertEqual(exit_code, 2)
+        self.assertIn('locate_media_or_check_unsupported', payload.getvalue())
+
+    def test_source_changed_during_attachment_hashing_is_not_emitted(self):
+        from wechat_local.attachment_resolver import AttachmentResolver
+        import hashlib
+        data = b'%PDF-1.7\nfixture'
+        files = self.root.resolve() / 'attachments'
+        files.mkdir()
+        (files / 'report.pdf').write_bytes(data)
+        xml = ('<msg><appmsg><type>6</type><title>report.pdf</title><appattach>'
+               f'<totallen>{len(data)}</totallen><md5>{hashlib.md5(data).hexdigest()}</md5>'
+               '</appattach></appmsg></msg>')
+        with sqlite3.connect(self.source_path) as source:
+            source.execute(f'UPDATE {TABLE} SET local_type=49,message_content=? WHERE local_id=2', (xml,))
+        runtime = self._runtime()
+        resolver = AttachmentResolver(files, account_id='synthetic-account', source_generation='synthetic-generation')
+        runtime.attachment_resolver = resolver
+        verify = resolver._verify
+        def changed(*args):
+            result = verify(*args)
+            with sqlite3.connect(self.source_path) as source:
+                source.execute(f'UPDATE {TABLE} SET real_sender_id=999,message_content=? WHERE local_id=2', ('changed fixture',))
+            return result
+        emitted = []
+        with patch.object(resolver, '_verify', changed):
+            result = runtime.scan(TimeWindow.from_utc(START, END), display_limit=50, on_base_messages=emitted.append)
+        self.assertEqual(result.status, 'unavailable')
+        self.assertEqual(result.groups, ())
+        self.assertEqual(emitted, [])
+
     def test_source_filter_is_applied_before_preflight_and_message_read(self) -> None:
         statements: list[str] = []
         shard = self.catalog.shard_for_source(self.source)
@@ -737,6 +808,7 @@ class CodexFirstRuntimeTests(unittest.TestCase):
             "argparse",
             "collections",
             "concurrent",
+            "contextlib",
             "dataclasses",
             "datetime",
             "hashlib",

@@ -195,6 +195,7 @@ def read_message_window(
     collect_voice_packed: bool = False,
     _cancelled: Callable[[], bool] | None = None,
     _sender_id: int | None = None,
+    _local_ids: tuple[int, ...] | None = None,
 ) -> WindowReadResult:
     """Read source rows in an inclusive create-time window without mutation.
 
@@ -212,10 +213,20 @@ def read_message_window(
         raise ValueError("start_unix_seconds must not exceed end_unix_seconds")
     if batch_size < 1 or batch_size > 10_000:
         raise ValueError("batch_size must be between 1 and 10000")
+    if _local_ids is not None and (not _local_ids or len(_local_ids) > 100 or
+            any(type(value) is not int for value in _local_ids) or len(set(_local_ids)) != len(_local_ids)):
+        raise ValueError('invalid selected local IDs')
 
     _require_query_only(conn)
     columns = _table_columns(conn, table_name)
     quoted_table = quote_identifier(table_name)
+    if _local_ids is not None:
+        placeholders = ','.join('?' for _ in _local_ids)
+        counts = conn.execute(
+            f'SELECT local_id, count(*) FROM {quoted_table} WHERE local_id IN ({placeholders}) GROUP BY local_id',
+            _local_ids).fetchall()
+        if len(counts) != len(_local_ids) or any(type(row[0]) is not int or row[1] != 1 for row in counts):
+            raise LiveTailerError('Selected source identity unavailable')
     server_id_expression = (
         quote_identifier("server_id") if "server_id" in columns else "NULL"
     )
@@ -258,6 +269,10 @@ def read_message_window(
         if _sender_id is not None:
             sender_predicate = " AND typeof(real_sender_id)='integer' AND real_sender_id=?"
             query_params = (*query_params[:-1], _sender_id, query_params[-1])
+        selected_predicate = ''
+        if _local_ids is not None:
+            selected_predicate = ' AND local_id IN (' + ','.join('?' for _ in _local_ids) + ')'
+            query_params = (*query_params[:-1], *_local_ids, query_params[-1])
         rows = conn.execute(
             f"""
             SELECT local_id, {server_id_expression}, local_type, create_time,
@@ -267,7 +282,7 @@ def read_message_window(
             WHERE typeof(create_time)='integer'
               AND create_time >= {SOURCE_TIMESTAMP_LOWER_BOUND}
               AND create_time < {SOURCE_TIMESTAMP_UPPER_BOUND}
-              AND create_time >= ? AND create_time <= ?{local_id_predicate}{sender_predicate}
+              AND create_time >= ? AND create_time <= ?{local_id_predicate}{sender_predicate}{selected_predicate}
             ORDER BY local_id ASC
             LIMIT ?
             """,
