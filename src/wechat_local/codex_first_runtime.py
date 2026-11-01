@@ -1756,8 +1756,6 @@ def _run_cli(args: argparse.Namespace) -> int:
         raise LiveReadonlyError(
             "Local voice runtime and Python executable must be configured together"
         )
-    if args.voice_jsonl and args.json:
-        raise LiveReadonlyError("Choose either --json or --voice-jsonl")
     if args.voice_runtime_root is not None and not args.voice_jsonl:
         raise LiveReadonlyError(
             "Local voice transcription requires --voice-jsonl so messages are emitted first"
@@ -2459,10 +2457,10 @@ def _run_cli(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.json and args.voice_jsonl:
-        print(json.dumps({"status": "unavailable", "error_code": "invalid_arguments",
-                          "diagnostics": {"failures": [{"stage": "arguments",
-                                                       "reason": "conflicting_output_formats"}]}}, sort_keys=True))
-        return 2
+        if args.check_config:
+            args.voice_jsonl = False
+        else:
+            args.json = False
     identity_error: str | None = None
     try:
         result = _run_cli(args)
@@ -2499,7 +2497,7 @@ def main(argv: list[str] | None = None) -> int:
         category = "runtime_unavailable"
         reason = _diagnostic_reason(error)
     failure = {"stage": getattr(args, "_diagnostic_stage", "configuration"), "reason": reason}
-    if args.voice_jsonl and (getattr(args, '_stream_started', False) or args.contact_query is not None or args.group_query is not None or args.conversation_username is not None or args.locate_related_groups) and not getattr(args, '_stream_complete', False):
+    if args.voice_jsonl and (not args.check_config or getattr(args, '_stream_started', False) or args.contact_query is not None or args.group_query is not None or args.conversation_username is not None or args.locate_related_groups) and not getattr(args, '_stream_complete', False):
         print(json.dumps({'phase': 'complete', 'status': 'unavailable', 'error_code': category,
                           **({'target_resolution': args._target_resolution} if hasattr(args, '_target_resolution') else {}),
                           'diagnostics': {'failures': [failure]}}, sort_keys=True), flush=True)
