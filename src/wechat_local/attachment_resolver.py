@@ -159,27 +159,55 @@ class AttachmentResolver:
             os.close(directory)
 
     def _check_directory_stamps(self, stamps):
-        """Reopen every enumerated directory without following links."""
+        """Validate every directory with a bounded, no-follow ancestor stack."""
+        stack = []
+        failure = None
         try:
             if self._root_stamp() != self._root_identity:
                 raise ValueError('directory_changed')
+            by_path = {folder.relative_to(self.root).parts: expected for folder, expected in stamps}
+            if len(by_path) != len(stamps) or () not in by_path or any(len(parts) > 8 for parts in by_path):
+                raise ValueError('directory_changed')
             root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                for folder, expected in stamps:
-                    current = os.dup(root_fd)
-                    try:
-                        for part in folder.relative_to(self.root).parts:
-                            following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
-                            os.close(current)
-                            current = following
-                        if _stamp(os.fstat(current)) != expected:
-                            raise ValueError('directory_changed')
-                    finally:
-                        os.close(current)
-            finally:
-                os.close(root_fd)
-        except (OSError, ValueError) as error:
-            raise ValueError('directory_changed') from error
+            stack.append(((), root_fd, by_path[()]))
+
+            def recheck():
+                for _, fd, expected in stack:
+                    if _stamp(os.fstat(fd)) != expected:
+                        raise ValueError('directory_changed')
+
+            for parts in sorted(by_path):
+                common = 0
+                previous = stack[-1][0]
+                while common < min(len(parts), len(previous)) and parts[common] == previous[common]:
+                    common += 1
+                recheck()
+                while len(stack) > common + 1:
+                    _, fd, _ = stack.pop()
+                    os.close(fd)
+                for depth in range(common + 1, len(parts) + 1):
+                    prefix = parts[:depth]
+                    if prefix not in by_path:
+                        raise ValueError('directory_changed')
+                    fd = os.open(parts[depth - 1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=stack[-1][1])
+                    stack.append((prefix, fd, by_path[prefix]))
+                    if _stamp(os.fstat(fd)) != by_path[prefix]:
+                        raise ValueError('directory_changed')
+                recheck()
+        except BaseException as error:
+            failure = error
+        finally:
+            while stack:
+                _, fd, _ = stack.pop()
+                try:
+                    os.close(fd)
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+        if failure is not None:
+            if isinstance(failure, (OSError, ValueError)):
+                raise ValueError('directory_changed') from failure
+            raise failure
 
     def _check_candidate_type(self, relative):
         path = PurePosixPath(relative)

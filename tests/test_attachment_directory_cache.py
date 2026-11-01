@@ -1,11 +1,12 @@
 """One-query attachment directory snapshot, using synthetic local files."""
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 from tests.test_attachment_resolver import SOURCE, message
-from wechat_local.attachment_resolver import AttachmentResolver, ResourceBinding
+from wechat_local.attachment_resolver import AttachmentResolver, ResourceBinding, _stamp
 from wechat_local.event_store import _content_fingerprint
 
 
@@ -148,3 +149,86 @@ class AttachmentDirectoryCacheTests(unittest.TestCase):
         result=self.resolve('a.pdf')
         self.assertEqual((result['status'],result['reason']),('scan_incomplete','depth_limit'))
         self.assertIsNone(self.resolver._directory_index)
+
+    def test_stamp_validation_reuses_ancestor_fds_with_depth_bound(self):
+        deep=self.root/'sub/one/two';deep.mkdir(parents=True)
+        sibling=self.root/'sub/other';sibling.mkdir()
+        folders=[self.root,self.root/'sub',self.root/'sub/one',deep,sibling]
+        stamps=[(p,_stamp(p.stat())) for p in folders]
+        original_open,original_dup,original_close=os.open,os.dup,os.close
+        active=set();counts={'open':0,'dup':0,'peak':0}
+        def opened(*args,**kwargs):
+            fd=original_open(*args,**kwargs)
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                active.add(fd);counts['open']+=1;counts['peak']=max(counts['peak'],len(active))
+            return fd
+        def closed(fd):
+            active.discard(fd);return original_close(fd)
+        def dup(fd):
+            counts['dup']+=1;return original_dup(fd)
+        with patch('wechat_local.attachment_resolver.os.open',side_effect=opened), \
+             patch('wechat_local.attachment_resolver.os.close',side_effect=closed), \
+             patch('wechat_local.attachment_resolver.os.dup',side_effect=dup):
+            self.resolver._check_directory_stamps(stamps)
+        self.assertEqual(counts['open'],len(folders))
+        self.assertEqual(counts['dup'],0)
+        self.assertLessEqual(counts['peak'],4)
+        self.assertFalse(active)
+
+    def test_stamp_validation_closes_all_ancestors_on_interrupt_and_close_failure(self):
+        (self.root/'sub/one/two').mkdir(parents=True)
+        folders=[self.root,self.root/'sub',self.root/'sub/one',self.root/'sub/one/two']
+        stamps=[(p,_stamp(p.stat())) for p in folders]
+        original_open,original_close=os.open,os.close
+        active=set();seen=[]
+        def opened(*args,**kwargs):
+            if len(active)==3:raise KeyboardInterrupt()
+            fd=original_open(*args,**kwargs);active.add(fd);return fd
+        def closed(fd):
+            seen.append(fd);active.discard(fd);original_close(fd)
+            if len(seen)==1:raise OSError('synthetic close failure')
+        with patch('wechat_local.attachment_resolver.os.open',side_effect=opened), \
+             patch('wechat_local.attachment_resolver.os.close',side_effect=closed):
+            with self.assertRaises(KeyboardInterrupt):self.resolver._check_directory_stamps(stamps)
+        self.assertEqual(len(seen),3)
+        self.assertFalse(active)
+
+    def test_stamp_validation_close_failure_still_closes_remaining(self):
+        (self.root/'sub/one/two').mkdir(parents=True)
+        folders=[self.root,self.root/'sub',self.root/'sub/one',self.root/'sub/one/two']
+        stamps=[(p,_stamp(p.stat())) for p in folders]
+        original_open,original_close=os.open,os.close;active=set();seen=[]
+        def opened(*args,**kwargs):
+            fd=original_open(*args,**kwargs);active.add(fd);return fd
+        def closed(fd):
+            seen.append(fd);active.discard(fd);original_close(fd)
+            if len(seen)==1:raise OSError('synthetic close failure')
+        with patch('wechat_local.attachment_resolver.os.open',side_effect=opened), \
+             patch('wechat_local.attachment_resolver.os.close',side_effect=closed):
+            with self.assertRaisesRegex(ValueError,'directory_changed'):
+                self.resolver._check_directory_stamps(stamps)
+        self.assertEqual(len(seen),4);self.assertFalse(active)
+
+    def test_stamp_validation_detects_ancestor_replaced_during_traversal(self):
+        (self.root/'sub/one/two').mkdir(parents=True)
+        folders=[self.root,self.root/'sub',self.root/'sub/one',self.root/'sub/one/two']
+        stamps=[(p,_stamp(p.stat())) for p in folders];moved=self.root.with_name(self.root.name+'-moved')
+        original=os.open;mutated=[]
+        def opened(path,*args,**kwargs):
+            if path=='two' and not mutated:
+                (self.root/'sub').rename(moved);(self.root/'sub').symlink_to(moved,target_is_directory=True);mutated.append(True)
+            return original(path,*args,**kwargs)
+        try:
+            with patch('wechat_local.attachment_resolver.os.open',side_effect=opened):
+                with self.assertRaisesRegex(ValueError,'directory_changed'):
+                    self.resolver._check_directory_stamps(stamps)
+            self.assertTrue(mutated)
+        finally:
+            if mutated:(self.root/'sub').unlink();moved.rename(self.root/'sub')
+
+    def test_stamp_validation_accepts_full_allowed_depth(self):
+        folders=[self.root];p=self.root
+        for number in range(8):
+            p=p/('a%d'%number);p.mkdir();folders.append(p)
+        stamps=[(p,_stamp(p.stat())) for p in folders]
+        self.resolver._check_directory_stamps(stamps)
