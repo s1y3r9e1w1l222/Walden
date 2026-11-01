@@ -170,21 +170,23 @@ class AttachmentResolver:
                 raise ValueError('directory_changed')
             root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             stack.append(((), root_fd, by_path[()]))
+            if _stamp(os.fstat(root_fd)) != by_path[()]:
+                raise ValueError('directory_changed')
 
-            def recheck():
-                for _, fd, expected in stack:
-                    if _stamp(os.fstat(fd)) != expected:
-                        raise ValueError('directory_changed')
+            def close_checked():
+                _, fd, expected = stack[-1]
+                if _stamp(os.fstat(fd)) != expected:
+                    raise ValueError('directory_changed')
+                stack.pop()
+                os.close(fd)
 
             for parts in sorted(by_path):
                 common = 0
                 previous = stack[-1][0]
                 while common < min(len(parts), len(previous)) and parts[common] == previous[common]:
                     common += 1
-                recheck()
                 while len(stack) > common + 1:
-                    _, fd, _ = stack.pop()
-                    os.close(fd)
+                    close_checked()
                 for depth in range(common + 1, len(parts) + 1):
                     prefix = parts[:depth]
                     if prefix not in by_path:
@@ -193,7 +195,8 @@ class AttachmentResolver:
                     stack.append((prefix, fd, by_path[prefix]))
                     if _stamp(os.fstat(fd)) != by_path[prefix]:
                         raise ValueError('directory_changed')
-                recheck()
+            while stack:
+                close_checked()
         except BaseException as error:
             failure = error
         finally:
