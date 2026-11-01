@@ -363,6 +363,53 @@ def _first_xml_text(root: ET.Element | None, paths: tuple[str, ...]) -> str | No
     return None
 
 
+def _system_profile_template(root: ET.Element | None) -> str | None:
+    """Resolve only the known profile template; never render link targets or raw XML."""
+    if root is None or root.tag != "sysmsg" or root.get("type") != "sysmsgtemplate":
+        return None
+    containers = root.findall("./sysmsgtemplate/content_template")
+    if len(containers) != 1 or containers[0].get("type") != "tmpl_type_profile":
+        return None
+    container = containers[0]
+    plain = container.findall("./plain")
+    if len(plain) > 1 or (plain and len(plain[0])):
+        return None
+    if plain and _clean_optional_text(plain[0].text):
+        return _clean_optional_text(plain[0].text)
+    templates = container.findall("./template")
+    lists = container.findall("./link_list")
+    if len(templates) != 1 or len(templates[0]) or len(lists) != 1:
+        return None
+    template = _clean_optional_text(templates[0].text)
+    if not template or len(template) > 8192:
+        return None
+    names = re.findall(r"\$([A-Za-z_][A-Za-z0-9_]{0,63})\$", template)
+    if not names or len(names) > 32 or "$" in re.sub(r"\$([A-Za-z_][A-Za-z0-9_]{0,63})\$", "", template):
+        return None
+    links = lists[0].findall("./link")
+    if len(links) > 32:
+        return None
+    replacements = {}
+    for name in set(names):
+        found = [link for link in links if link.get("name") == name]
+        if len(found) != 1 or found[0].get("type") != "link_profile":
+            return None
+        members = found[0].findall("./memberlist/member")
+        if len(members) != 1:
+            return None
+        usernames = members[0].findall("./username")
+        nicknames = members[0].findall("./nickname")
+        if len(usernames) != 1 or len(nicknames) != 1 or len(usernames[0]) or len(nicknames[0]):
+            return None
+        username = _clean_optional_text(usernames[0].text)
+        nickname = _clean_optional_text(nicknames[0].text)
+        if not username or not nickname or len(nickname) > 512:
+            return None
+        replacements[name] = nickname
+    result = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]{0,63})\$", lambda match: replacements[match.group(1)], template)
+    return result
+
+
 def _optional_attribute(node: ET.Element | None, *names: str) -> str | None:
     if node is None:
         return None
@@ -489,7 +536,8 @@ def _structured_content(
         if parsed.quality_code is not None:
             quality_codes.add(parsed.quality_code)
             return kind, None, {}
-        return kind, _first_xml_text(parsed.root, (".//content", "content")), {}
+        text = _first_xml_text(parsed.root, (".//content", "content"))
+        return kind, text if text is not None else _system_profile_template(parsed.root), {}
     return kind, None, {}
 
 

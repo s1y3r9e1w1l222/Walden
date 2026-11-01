@@ -13,6 +13,7 @@ from .live_identity import LiveIdentityAdapter, _username_for_table
 from .live_readonly import open_encrypted_readonly, read_private_passphrase, readonly_database_uri
 from .live_tailer import _table_columns
 from .source_setup import load_source_config
+from .standard_event_repository import ProjectionProfile
 
 
 class ReplySourceError(ValueError):
@@ -108,6 +109,7 @@ def verify_reply_sources(config_path, event_ids, target_id, target_label):
         if (identity.contact_source_status() != 'configured' or identity._contact_record(target_id) is None
                 or identity._contact_display_name(target_id) != target_label):
             raise ReplySourceError('source_unavailable')
+        normalizer_profile = ProjectionProfile()
         candidates = []
         bindings = []
         checked_tables = set()
@@ -117,8 +119,10 @@ def verify_reply_sources(config_path, event_ids, target_id, target_label):
                 r.create_time,r.real_sender_id,r.content_fingerprint FROM standard_event_materializations m
                 JOIN event_revisions r ON r.id=m.source_revision_id
                 JOIN events e ON e.id=r.event_id AND e.current_revision_id=r.id
-                WHERE m.event_id=? AND e.account_id=? AND e.source_generation=?''',
-                (event_id, profile['account_id'], profile['source_generation'])).fetchall()
+                WHERE m.event_id=? AND e.account_id=? AND e.source_generation=?
+                  AND m.contract_version=? AND m.normalizer_name=? AND m.normalizer_version=?''',
+                (event_id, profile['account_id'], profile['source_generation'], normalizer_profile.contract_version,
+                 normalizer_profile.normalizer_name, normalizer_profile.normalizer_version)).fetchall()
             if len(rows) != 1:
                 raise ReplySourceError('source_unavailable')
             row = rows[0]
@@ -164,7 +168,8 @@ def verify_reply_sources(config_path, event_ids, target_id, target_label):
                 or any(connection.execute('PRAGMA data_version').fetchone()[0] != version or _stamp(path) != before
                        for path, (connection, before, version) in connections.items())):
             raise ReplySourceError('source_unavailable')
-        binding = [str(config_path), config_stamp[0][:2], store_stamp[0][:2], contact_stamp[0][:2], target_id, target_label, bindings]
+        binding = [str(config_path), config_stamp[0][:2], store_stamp[0][:2], contact_stamp[0][:2], target_id, target_label,
+                   normalizer_profile.profile_id, bindings]
         digest=hashlib.sha256(json.dumps(binding, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
         return digest
     except ReplySourceError:

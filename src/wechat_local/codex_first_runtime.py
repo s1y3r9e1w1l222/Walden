@@ -719,8 +719,10 @@ class CodexFirstRuntime:
                     'r.server_id,r.local_type,r.create_time,r.real_sender_id,r.content_fingerprint '
                     'FROM standard_event_materializations m JOIN event_revisions r ON r.id=m.source_revision_id '
                     'JOIN events e ON e.id=r.event_id AND e.current_revision_id=r.id '
-                    'WHERE m.event_id=? AND e.account_id=? AND e.source_generation=?',
-                    (item['event_id'], self.account_id, self.source_generation),
+                    'WHERE m.event_id=? AND e.account_id=? AND e.source_generation=? '
+                    'AND m.contract_version=? AND m.normalizer_name=? AND m.normalizer_version=?',
+                    (item['event_id'], self.account_id, self.source_generation,
+                     service.profile.contract_version, service.profile.normalizer_name, service.profile.normalizer_version),
                 ).fetchall()
                 if len(rows) != 1:
                     raise EventStoreError('association_materialization_unavailable')
@@ -2456,6 +2458,11 @@ def _run_cli(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.json and args.voice_jsonl:
+        print(json.dumps({"status": "unavailable", "error_code": "invalid_arguments",
+                          "diagnostics": {"failures": [{"stage": "arguments",
+                                                       "reason": "conflicting_output_formats"}]}}, sort_keys=True))
+        return 2
     identity_error: str | None = None
     try:
         result = _run_cli(args)

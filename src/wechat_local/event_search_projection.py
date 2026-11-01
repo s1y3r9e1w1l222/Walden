@@ -321,6 +321,8 @@ def _project_materialization(
         citation_text = _bounded(text, MAX_CITATION_CHARS)
     elif safe_title:
         citation_text = _bounded(f"{content_kind}: {safe_title}", MAX_CITATION_CHARS)
+    elif content_kind == "system":
+        citation_text = "系统消息内容不可用"
     else:
         citation_text = _bounded(content_kind, MAX_CITATION_CHARS)
     searchable_text = _bounded(

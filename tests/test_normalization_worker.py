@@ -883,7 +883,7 @@ class NormalizationWorkerTests(unittest.TestCase):
         self.assertEqual(CONSUMER_NAME, "standard-event-normalizer")
         self.assertEqual(CONTRACT_VERSION, "wechat-local.standard-event/1")
         self.assertEqual(NORMALIZER_NAME, "wechat-macos-v4")
-        self.assertEqual(NORMALIZER_VERSION, "1")
+        self.assertEqual(NORMALIZER_VERSION, "2")
         worker = self._worker()
         self.assertEqual(worker.config.contract_version, CONTRACT_VERSION)
         self.assertEqual(worker.config.normalizer_name, NORMALIZER_NAME)
