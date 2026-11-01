@@ -1066,6 +1066,8 @@ class CodexFirstRuntime:
                 raise TypeError(f"{name} must be callable")
 
         self._query_failures = []
+        if self.attachment_resolver is not None:
+            self.attachment_resolver._begin_query()
         self._latest_ids = None
         self._latest_source_state = self._source_state() if _latest_limit is not None else None
         if _latest_limit is not None:

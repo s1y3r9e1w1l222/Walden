@@ -155,8 +155,11 @@ class CodexFirstRuntimeTests(unittest.TestCase):
         self.assertNotIn('attachment', without.groups[0].messages[0].event_ref)
         runtime.attachment_resolver = AttachmentResolver(files, account_id='synthetic-account',
                                                        source_generation='synthetic-generation')
-        first = runtime.scan(window, display_limit=50)
-        second = runtime.scan(window, display_limit=50)
+        import os
+        with patch('wechat_local.attachment_resolver.os.fwalk', wraps=os.fwalk) as walk:
+            first = runtime.scan(window, display_limit=50)
+            second = runtime.scan(window, display_limit=50)
+        self.assertEqual(walk.call_count, 2)  # One new snapshot for each query.
         ref = first.groups[0].messages[0].event_ref
         self.assertEqual(ref['attachment']['status'], 'resolved')
         self.assertEqual(ref['attachment']['path'], str(path))

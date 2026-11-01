@@ -126,6 +126,10 @@ class AttachmentResolver:
         self.max_entries = max_entries
         # Remember directory identity; a replaced account root cannot reuse it.
         self._root_identity = self._root_stamp()
+        self._directory_index = None
+
+    def _begin_query(self):
+        self._directory_index = None
 
     def _root_stamp(self):
         if self.root.resolve() != self.root:
@@ -154,8 +158,61 @@ class AttachmentResolver:
         finally:
             os.close(directory)
 
+    def _check_directory_stamps(self, stamps):
+        """Reopen every enumerated directory without following links."""
+        try:
+            if self._root_stamp() != self._root_identity:
+                raise ValueError('directory_changed')
+            root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                for folder, expected in stamps:
+                    current = os.dup(root_fd)
+                    try:
+                        for part in folder.relative_to(self.root).parts:
+                            following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+                            os.close(current)
+                            current = following
+                        if _stamp(os.fstat(current)) != expected:
+                            raise ValueError('directory_changed')
+                    finally:
+                        os.close(current)
+            finally:
+                os.close(root_fd)
+        except (OSError, ValueError) as error:
+            raise ValueError('directory_changed') from error
+
+    def _check_candidate_type(self, relative):
+        path = PurePosixPath(relative)
+        directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for part in path.parts[:-1]:
+                following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                os.close(directory)
+                directory = following
+            if not stat.S_ISREG(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
+                raise ValueError('unsafe_path')
+        finally:
+            os.close(directory)
+
     def _candidates(self, name):
+        if self._directory_index is not None:
+            index, stamps = self._directory_index
+            try:
+                self._check_directory_stamps(stamps)
+            except ValueError:
+                # The previous resolve's snapshot is no longer current. Start
+                # a new complete scan before selecting this resolve's files.
+                self._directory_index = None
+            else:
+                candidates = index.get(name, ())
+                if len(candidates) > 100:
+                    raise ValueError('candidate_limit')
+                for relative in candidates:
+                    self._check_candidate_type(relative)
+                self._check_directory_stamps(stamps)
+                return list(candidates), stamps
         candidates = []
+        index = {}
         entries = 0
         stamps = []
         before_enumeration = {self.root: _stamp(self.root.stat())}
@@ -176,6 +233,9 @@ class AttachmentResolver:
                 info = os.stat(child, dir_fd=directory, follow_symlinks=False)
                 if stat.S_ISDIR(info.st_mode):
                     before_enumeration[folder / child] = _stamp(info)
+            for child in files:
+                relative = str((folder / child).relative_to(self.root))
+                index.setdefault(child, []).append(relative)
             if name in files:
                 info = os.stat(name, dir_fd=directory, follow_symlinks=False)
                 if not stat.S_ISREG(info.st_mode):
@@ -183,10 +243,10 @@ class AttachmentResolver:
                 candidates.append(str((folder / name).relative_to(self.root)))
                 if len(candidates) > 100:
                     raise ValueError('candidate_limit')
-        for folder, before in stamps:
-            if _stamp(folder.stat()) != before:
-                raise ValueError('directory_changed')
-        return sorted(candidates), stamps
+        self._check_directory_stamps(stamps)
+        complete = {key: tuple(sorted(values)) for key, values in index.items()}
+        self._directory_index = (complete, tuple(stamps))
+        return sorted(candidates), self._directory_index[1]
 
     def _verify(self, relative, size, expected_md5, extension, audit):
         with self._open(relative) as handle:
@@ -290,8 +350,10 @@ class AttachmentResolver:
                     if reason not in {'size_mismatch', 'hash_mismatch', 'format_mismatch'}:
                         return result('unsafe_path' if reason == 'unsafe_path' else 'unavailable', reason)
                     failures.append(reason)
-            if self._root_stamp() != self._root_identity or any(_stamp(folder.stat()) != stamp for folder, stamp in stamps):
+            if self._root_stamp() != self._root_identity:
                 return result('scan_incomplete', 'directory_changed')
+            if stamps:
+                self._check_directory_stamps(stamps)
             for relative, observed in audit.observed.items():
                 with self._open(relative) as current:
                     if _stamp(os.fstat(current.fileno())) != observed:
